@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: peft
 Version: 0.13.0
 Summary: Parameter-Efficient Fine-Tuning (PEFT)
@@ -55,6 +55,19 @@ Requires-Dist: parameterized; extra == "test"
 Requires-Dist: datasets; extra == "test"
 Requires-Dist: diffusers<0.21.0; extra == "test"
 Requires-Dist: scipy; extra == "test"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
 
 <!---
 Copyright 2023 The HuggingFace Team. All rights reserved.

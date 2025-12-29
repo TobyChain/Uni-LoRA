@@ -1,0 +1,12 @@
+[
+    {
+        "instruction": "Explain the concept of Mixture of Experts.",
+        "input": "",
+        "output": "Mixture of Experts (MoE) is a machine learning technique where multiple expert networks are used to divide a problem space..."
+    },
+    {
+        "instruction": "你好，请介绍一下你自己。",
+        "input": "",
+        "output": "我是Qwen，由阿里云开发的AI助手。"
+    }
+]

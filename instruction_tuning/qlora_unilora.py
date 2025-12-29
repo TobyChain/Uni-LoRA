@@ -1,14 +1,13 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
 import copy
 import json
 import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
-import sys
 from typing import Optional, Dict, Sequence
+import warnings
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -16,7 +15,6 @@ import bitsandbytes as bnb
 import pandas as pd
 import importlib
 from packaging import version
-from packaging.version import parse
 
 import torch
 import transformers
@@ -478,14 +476,14 @@ def get_accelerate_model(args, checkpoint_dir):
                 model, join(checkpoint_dir, "adapter_model"), is_trainable=True
             )
         else:
-            print(f"adding Uni-LoRA modules...")
+            print("adding Uni-LoRA modules...")
             modules = find_all_linear_names(args, model)
             config = UniLoRAConfig(
                 r=args.lora_r,
                 unilora_dropout=args.lora_dropout,
                 target_modules=modules,
                 num_vectors=args.num_vectors,
-                vector_length=256*args.num_vectors,
+                vector_length=256 * args.num_vectors,
                 save_only_topk_weights=False,
                 task_type="CAUSAL_LM",
             )
@@ -731,10 +729,10 @@ def create_optimizer(model, args) -> torch.optim.Optimizer:
                 skipped += sum(
                     {p.data_ptr(): p.numel() for p in module.parameters()}.values()
                 )
-                logger.info(f"skipped {module}: {skipped/2**20}M params")
+                logger.info(f"skipped {module}: {skipped / 2**20}M params")
                 manager.register_module_override(module, "weight", {"optim_bits": 32})
                 logger.debug(f"bitsandbytes: will optimize {module} in fp32")
-        logger.info(f"skipped: {skipped/2**20}M params")
+        logger.info(f"skipped: {skipped / 2**20}M params")
 
     return optimizer
 
@@ -789,7 +787,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                     )
                     full_dataset = local_dataset(dataset_name)
                     return full_dataset
-                except:
+                except:  # noqa: E722
                     raise ValueError(f"Error loading dataset from {dataset_name}")
             else:
                 raise NotImplementedError(

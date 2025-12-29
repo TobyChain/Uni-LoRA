@@ -22,7 +22,9 @@ from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
+
 from .._buffer_dict import BufferDict
+
 
 class UniLoRALayer(BaseTunerLayer):
     # List all names of layers that may contain adapter weights
@@ -101,20 +103,20 @@ class UniLoRALayer(BaseTunerLayer):
     def reset_unilora_logits(self, adapter_name, vector_length):
         if adapter_name in self.unilora_vector_bank.keys():
             logits_A = torch.randint(0, vector_length, (self.r[adapter_name], self.in_features), dtype=torch.long)
-            logits_B = torch.randint(0, vector_length, (self.out_features,self.r[adapter_name]), dtype=torch.long) 
+            logits_B = torch.randint(0, vector_length, (self.out_features,self.r[adapter_name]), dtype=torch.long)
             self.unilora_logits_A[adapter_name] = logits_A
             self.unilora_logits_B[adapter_name] = logits_B
-              
+
     def update_norm(
         self,
         adapter_name: str,
         unilora_norm_A,
         unilora_norm_B,
-    ):   
+    ):
         if adapter_name in self.unilora_vector_bank.keys():
             self.unilora_norm_A[adapter_name] = unilora_norm_A
             self.unilora_norm_B[adapter_name] = unilora_norm_B
-        
+
 
 class Linear(nn.Linear, UniLoRALayer):
     # VBLoRA implemented in a dense layer
@@ -194,8 +196,8 @@ class Linear(nn.Linear, UniLoRALayer):
     #     return (topk_weights.unsqueeze(-1) * unilora_vector_bank[indices]).sum(-2)
 
     def _get_lora_matrices(self, adapter, cast_to_fp32=False) -> Tuple[torch.Tensor, torch.Tensor]:
-        unilora_logits_A = self.unilora_logits_A[adapter] 
-        unilora_logits_B = self.unilora_logits_B[adapter] 
+        unilora_logits_A = self.unilora_logits_A[adapter]
+        unilora_logits_B = self.unilora_logits_B[adapter]
 
         # Check for infinity values when training. If found, training was likely resumed from a `save_only_topk_weights` model.
         if self.training and unilora_logits_A[0, 0].isinf().any():
@@ -214,11 +216,11 @@ class Linear(nn.Linear, UniLoRALayer):
             unilora_vector_bank = unilora_vector_bank.float()
         A = unilora_vector_bank[unilora_logits_A.long()] * self.unilora_norm_A[adapter]
         B = unilora_vector_bank[unilora_logits_B.long()] * self.unilora_norm_B[adapter]
-        
+
 
         # A: (rank, in_tile, vector_length) -> (rank, in_tile x vector_length)
-       
-        
+
+
         return A, B
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
