@@ -7,14 +7,19 @@ import argparse
 import copy
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import pandas as pd
 import torch
 import transformers
 from datasets import Dataset, load_dataset
-from modeling_unilora_moe import (
+
+# 添加 modeling 目录到路径
+sys.path.insert(0, str(Path(__file__).parent.parent / "modeling"))
+from modeling_unilora_moe import (  # pyright: ignore[reportMissingImports]
     apply_unilora_to_qwen_moe,
     freeze_router,
     freeze_unilora_adapters,

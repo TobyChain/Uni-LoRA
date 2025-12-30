@@ -6,14 +6,15 @@
 # Configuration
 MODEL_NAME="Qwen/Qwen1.5-MoE-A2.7B-Chat"
 OUTPUT_DIR="./output/qwen_moe_unilora"
-DATASET="alpaca"
+DATASET="alpaca-clean"
 RANK=64
 ALPHA=16.0
 TRAINING_STAGE=1  # 1: train adapters, 2: train router
 
 # DeepSpeed configuration (choose one)
-DS_CONFIG="ds_config.json"  # ZeRO-2
-# DS_CONFIG="ds_config_zero3.json"  # ZeRO-3 with CPU offload
+# 注意: 从 training 目录运行时，需要相对路径
+DS_CONFIG="../configs/ds_config.json"  # ZeRO-2
+# DS_CONFIG="../configs/ds_config_zero3.json"  # ZeRO-3 with CPU offload
 
 # Training hyperparameters
 NUM_GPUS=4
@@ -43,7 +44,7 @@ if [ ${TRAINING_STAGE} -eq 1 ]; then
     echo "Stage 1: Training Uni-LoRA Adapters"
     echo "=========================================="
     
-    deepspeed --num_gpus=${NUM_GPUS} train_qwen_moe_unilora.py \
+    deepspeed --num_gpus=${NUM_GPUS} train_unilora_moe.py \
         --model_name_or_path ${MODEL_NAME} \
         --dataset ${DATASET} \
         --output_dir ${OUTPUT_DIR}/stage1 \
@@ -99,7 +100,7 @@ elif [ ${TRAINING_STAGE} -eq 2 ]; then
     
     echo "Using checkpoint: ${STAGE1_CHECKPOINT}"
     
-    deepspeed --num_gpus=${NUM_GPUS} train_qwen_moe_unilora.py \
+    deepspeed --num_gpus=${NUM_GPUS} train_unilora_moe.py \
         --model_name_or_path ${MODEL_NAME} \
         --dataset ${DATASET} \
         --output_dir ${OUTPUT_DIR}/stage2 \

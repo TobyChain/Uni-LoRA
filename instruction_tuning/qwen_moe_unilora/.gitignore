@@ -1,0 +1,36 @@
+# 输出目录
+output/
+test_results/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 模型检查点
+checkpoint-*/
+*.pt
+*.bin
+*.safetensors
+
+# 日志文件
+*.log
+*.out
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# 环境
+.venv/
+venv/
+env/
+
