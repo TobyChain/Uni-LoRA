@@ -19,17 +19,41 @@ BITS=16  # No quantization (using bf16 + ZeRO-3 instead)
 
 # Training Hyperparameters (optimized for 2x 24GB GPUs with ZeRO-3)
 NUM_GPUS=2
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"2,5"}
 PER_DEVICE_TRAIN_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=24  # Effective batch size = 2 * 1 * 24 = 48
+GRADIENT_ACCUMULATION_STEPS=24
 LEARNING_RATE=2e-4
-LEARNING_RATE_VECTOR_BANK=1e-3  # Separate LR for vector bank (from qlora_unilora.py)
+LEARNING_RATE_VECTOR_BANK=1e-3
 NUM_TRAIN_EPOCHS=3
 SAVE_STEPS=500
 EVAL_STEPS=500
-MAX_STEPS=-1  # -1 for full epochs
+MAX_STEPS=-1
 WARMUP_RATIO=0.03
 MAX_GRAD_NORM=0.3
+
+# Auto-select GPUs if CUDA_VISIBLE_DEVICES not set
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    echo "Auto-selecting ${NUM_GPUS} most idle GPUs..."
+    
+    SELECTED_GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | while read line; do
+        idx=$(echo $line | cut -d',' -f1)
+        mem=$(echo $line | cut -d',' -f2)
+        # Check if any compute or graphics process is running on this GPU index
+        if ! nvidia-smi --query-compute-apps=gpu_index --format=csv,noheader | grep -q "^$idx$" && \
+           ! nvidia-smi --query-accounted-apps=gpu_index --format=csv,noheader | grep -q "^$idx$"; then
+            echo "$idx,$mem"
+        fi
+    done | sort -t',' -k2 -n | head -n ${NUM_GPUS} | cut -d',' -f1 | paste -sd ',' -)
+    
+    if [ -z "$SELECTED_GPUS" ]; then
+        echo "Error: Failed to auto-select GPUs. Please set CUDA_VISIBLE_DEVICES manually."
+        exit 1
+    fi
+    
+    export CUDA_VISIBLE_DEVICES=$SELECTED_GPUS
+    echo "Selected GPUs: $CUDA_VISIBLE_DEVICES"
+else
+    echo "Using pre-set GPUs: $CUDA_VISIBLE_DEVICES"
+fi
 
 # DeepSpeed ZeRO-3 Config
 DS_CONFIG="../configs/ds_config_zero3.json"
@@ -38,7 +62,6 @@ if [ ! -f "$DS_CONFIG" ]; then
     if [ -f "ds_config_zero3.json" ]; then
         DS_CONFIG="ds_config_zero3.json"
     else
-        # Try finding it relative to the script location
         SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
         if [ -f "$SCRIPT_DIR/../configs/ds_config_zero3.json" ]; then
              DS_CONFIG="$SCRIPT_DIR/../configs/ds_config_zero3.json"
@@ -48,12 +71,11 @@ fi
 echo "Using DeepSpeed Config: $DS_CONFIG"
 
 # Environment Setup
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 echo "=========================================="
 echo "Starting Uni-LoRA Pipeline (Refactored)"
@@ -74,7 +96,7 @@ echo ""
 OUTPUT_DIR_S1="${OUTPUT_BASE_DIR}/stage1"
 
 # Launch with deepspeed
-deepspeed --master_port=29505 --include localhost:${CUDA_VISIBLE_DEVICES} train_unilora_moe.py \
+/data2/guanbingtao/miniforge3/envs/instruction_tuning/bin/deepspeed --master_port=29505 --include localhost:${CUDA_VISIBLE_DEVICES} train_unilora_moe.py \
     --model_name_or_path ${MODEL_NAME} \
     --trust_remote_code \
     --dataset ${DATASET} \
@@ -125,7 +147,7 @@ echo ""
 
 OUTPUT_DIR_S2="${OUTPUT_BASE_DIR}/stage2"
 
-deepspeed --master_port=29505 --include localhost:${CUDA_VISIBLE_DEVICES} train_unilora_moe.py \
+/data2/guanbingtao/miniforge3/envs/instruction_tuning/bin/deepspeed --master_port=29505 --include localhost:${CUDA_VISIBLE_DEVICES} train_unilora_moe.py \
     --model_name_or_path ${MODEL_NAME} \
     --trust_remote_code \
     --dataset ${DATASET} \

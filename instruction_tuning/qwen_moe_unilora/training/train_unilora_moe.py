@@ -59,9 +59,9 @@ class ModelArguments:
             "help": "Enable unpickling of arbitrary code in AutoModelForCausalLM."
         },
     )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={"help": "Enables using Huggingface auth token from Git Credentials."},
+    token: Optional[str] = field(
+        default=None,
+        metadata={"help": "Huggingface auth token."},
     )
 
 
@@ -744,9 +744,9 @@ def main():
         device_map=device_map,
         max_memory=max_memory,
         quantization_config=quantization_config,
-        torch_dtype=compute_dtype,
+        dtype=compute_dtype,
         trust_remote_code=model_args.trust_remote_code,
-        use_auth_token=model_args.use_auth_token,
+        token=model_args.token,
         low_cpu_mem_usage=True,
     )
 
@@ -805,7 +805,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=model_args.trust_remote_code,
-        use_auth_token=model_args.use_auth_token,
+        token=model_args.token,
         padding_side="right",
         use_fast=False,
     )
