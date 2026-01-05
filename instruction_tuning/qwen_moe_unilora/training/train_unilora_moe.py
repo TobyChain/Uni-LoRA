@@ -5,17 +5,27 @@ Supports two-stage training: Stage 1 (freeze router), Stage 2 (freeze adapters, 
 
 import argparse
 import copy
+import json
 import logging
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from collections.abc import Sequence
 
 import pandas as pd
 import torch
 import transformers
 from datasets import Dataset, load_dataset
+from peft import prepare_model_for_kbit_training
+from torch.nn.utils.rnn import pad_sequence
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    Trainer,
+    set_seed,
+)
 
 # 添加 modeling 目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "modeling"))
@@ -24,18 +34,8 @@ from modeling_unilora_moe import (  # pyright: ignore[reportMissingImports]
     freeze_router,
     freeze_unilora_adapters,
 )
-from peft import prepare_model_for_kbit_training
-from torch.nn.utils.rnn import pad_sequence
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    Trainer,
-    TrainingArguments,
-    set_seed,
-)
 
-logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
@@ -46,58 +46,118 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 class ModelArguments:
     model_name_or_path: str = field(
         default="Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        metadata={
-            "help": "Path to pretrained model or model identifier from huggingface.co/models"
-        },
+        metadata={"help": "Model identifier or local path."},
     )
     trust_remote_code: bool = field(
         default=True,
         metadata={
-            "help": "Enable unpickling of arbitrary code in AutoModelForCausalLM"
+            "help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."
         },
+    )
+
+    load_in_4bit: bool = field(
+        default=False,
+        metadata={"help": "Load base model with bitsandbytes 4-bit NF4 quantization."},
+    )
+
+    load_in_8bit: bool = field(
+        default=False,
+        metadata={"help": "Load base model with bitsandbytes 8-bit quantization."},
     )
 
 
 @dataclass
 class DataArguments:
-    dataset: str = field(default="alpaca", metadata={"help": "Dataset name or path"})
-    dataset_format: Optional[str] = field(
+    dataset: str = field(
+        default="alpaca-clean",
+        metadata={"help": "Which dataset to finetune on. See datamodule for options."},
+    )
+    dataset_format: str | None = field(
         default=None,
-        metadata={"help": "Dataset format: alpaca, chip2, self-instruct, etc."},
+        metadata={
+            "help": "Which dataset format is used. [alpaca|alpaca-clean|chip2|self-instruct|hh-rlhf|oasst1|input-output]"
+        },
     )
     source_max_len: int = field(
-        default=1024, metadata={"help": "Maximum source sequence length"}
+        default=1024,
+        metadata={"help": "Maximum source sequence length."},
     )
     target_max_len: int = field(
-        default=256, metadata={"help": "Maximum target sequence length"}
-    )
-    max_train_samples: Optional[int] = field(
-        default=None, metadata={"help": "Maximum number of training samples"}
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None, metadata={"help": "Maximum number of evaluation samples"}
+        default=256,
+        metadata={"help": "Maximum target sequence length."},
     )
     eval_dataset_size: int = field(
-        default=1024, metadata={"help": "Size of validation dataset"}
+        default=1024,
+        metadata={"help": "Size of validation dataset (examples)."},
+    )
+    max_train_samples: int | None = field(
+        default=None,
+        metadata={"help": "Truncate number of training examples (debug)."},
+    )
+    max_eval_samples: int | None = field(
+        default=None,
+        metadata={"help": "Truncate number of evaluation examples (debug)."},
     )
 
 
 @dataclass
 class UniLoRAArguments:
-    rank: int = field(default=64, metadata={"help": "Rank of Uni-LoRA adaptation"})
-    alpha: float = field(
-        default=16.0, metadata={"help": "Scaling factor (alpha) for Uni-LoRA"}
-    )
+    rank: int = field(default=64, metadata={"help": "Uni-LoRA rank."})
+    alpha: float = field(default=16.0, metadata={"help": "Uni-LoRA alpha."})
     training_stage: int = field(
         default=1,
         metadata={
             "help": "Training stage: 1 (freeze router, train adapters) or 2 (freeze adapters, train router)"
         },
     )
+    use_matrix_mode: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use matrix mode (rank > 1) for the shared vector bank, reserving more space for parameters."
+        },
+    )
+    reserve_memory_mb: int = field(
+        default=0,
+        metadata={
+            "help": "Reserve GPU memory (in MB) at the beginning of the script to prevent OOM or fragmentation issues."
+        },
+    )
+
+
+@dataclass
+class TrainingArguments(transformers.Seq2SeqTrainingArguments):
+    train_on_source: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to train on the input in addition to the target text."
+        },
+    )
+
+    # Compatibility for older launch scripts.
+    # transformers>=5 uses `eval_strategy` (not `evaluation_strategy`).
+    evaluation_strategy: str | None = field(
+        default=None,
+        metadata={"help": "Alias for eval_strategy (compat)."},
+    )
+
+    def __post_init__(self):
+        if self.evaluation_strategy is not None:
+            current = getattr(self, "eval_strategy", None)
+            if current is None or str(current) == "no":
+                self.eval_strategy = self.evaluation_strategy
+
+        current = getattr(self, "eval_strategy", None)
+        if current is not None and str(current) != "no" and not self.do_eval:
+            self.do_eval = True
+
+        # Fix dataset column issue
+        self.remove_unused_columns = False
+
+        super().__post_init__()
 
 
 def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
+    special_tokens_dict: dict,
     tokenizer: transformers.PreTrainedTokenizer,
     model: transformers.PreTrainedModel,
 ):
@@ -128,7 +188,7 @@ class DataCollatorForCausalLM:
     train_on_source: bool = False
     predict_with_generate: bool = False
 
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, instances: Sequence[dict]) -> dict[str, torch.Tensor]:
         sources = [
             f"{self.tokenizer.bos_token}{example['input']}" for example in instances
         ]
@@ -230,30 +290,27 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args):
     def load_data(dataset_name):
         if dataset_name == "alpaca":
             return load_dataset("tatsu-lab/alpaca")
-        elif dataset_name == "alpaca-clean":
+        if dataset_name == "alpaca-clean":
             return load_dataset("yahma/alpaca-cleaned")
-        elif dataset_name == "chip2":
+        if dataset_name == "chip2":
             return load_dataset("laion/OIG", data_files="unified_chip2.jsonl")
-        elif dataset_name == "self-instruct":
+        if dataset_name == "self-instruct":
             return load_dataset("yizhongw/self_instruct", name="self_instruct")
-        elif dataset_name == "hh-rlhf":
+        if dataset_name == "hh-rlhf":
             return load_dataset("Anthropic/hh-rlhf")
-        elif dataset_name == "oasst1":
+        if dataset_name == "oasst1":
             return load_dataset("timdettmers/openassistant-guanaco")
-        else:
-            if os.path.exists(dataset_name):
-                try:
-                    args.dataset_format = (
-                        args.dataset_format if args.dataset_format else "input-output"
-                    )
-                    full_dataset = local_dataset(dataset_name)
-                    return full_dataset
-                except Exception as e:
-                    raise ValueError(f"Error loading dataset from {dataset_name}: {e}")
-            else:
-                raise NotImplementedError(
-                    f"Dataset {dataset_name} not implemented yet."
+        if os.path.exists(dataset_name):
+            try:
+                args.dataset_format = (
+                    args.dataset_format if args.dataset_format else "input-output"
                 )
+                full_dataset = local_dataset(dataset_name)
+                return full_dataset
+            except Exception as e:
+                raise ValueError(f"Error loading dataset from {dataset_name}: {e}")
+        else:
+            raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
 
     def format_dataset(dataset, dataset_format):
         if (
@@ -294,13 +351,26 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args):
         elif dataset_format == "input-output":
             pass
 
-        dataset = dataset.remove_columns(
-            [
-                col
-                for col in dataset.column_names["train"]
-                if col not in ["input", "output"]
+        # Handle both DatasetDict and Dataset
+        if hasattr(dataset, "column_names") and isinstance(dataset.column_names, dict):
+            # DatasetDict: remove columns from each split
+            for split_name in dataset.column_names:
+                cols_to_remove = [
+                    col
+                    for col in dataset[split_name].column_names
+                    if col not in ["input", "output"]
+                ]
+                if cols_to_remove:
+                    dataset[split_name] = dataset[split_name].remove_columns(
+                        cols_to_remove
+                    )
+        else:
+            # Single Dataset: remove columns directly
+            cols_to_remove = [
+                col for col in dataset.column_names if col not in ["input", "output"]
             ]
-        )
+            if cols_to_remove:
+                dataset = dataset.remove_columns(cols_to_remove)
         return dataset
 
     dataset = load_data(args.dataset)
@@ -372,13 +442,112 @@ def print_trainable_parameters(model):
     )
 
 
+def print_memory_usage(prefix=""):
+    if not torch.cuda.is_available():
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    device = (
+        torch.device(f"cuda:{local_rank}") if local_rank >= 0 else torch.device("cuda")
+    )
+    allocated = torch.cuda.memory_allocated(device) / (1024 * 1024)
+    reserved = torch.cuda.memory_reserved(device) / (1024 * 1024)
+    logger.info(
+        f"{prefix} Memory: Allocated {allocated:.2f}MB, Reserved {reserved:.2f}MB on {device}"
+    )
+
+
 def main():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, UniLoRAArguments, TrainingArguments)
     )
-    model_args, data_args, unilora_args, training_args = (
-        parser.parse_args_into_dataclasses()
+
+    # Parse and keep unknown args for compatibility handling
+    model_args, data_args, unilora_args, training_args, remaining = (
+        parser.parse_args_into_dataclasses(return_remaining_strings=True)
     )
+
+    # Inspect DeepSpeed config to get ZeRO stage (without forbidding CPU offload)
+    ds_zero_stage = None
+    if getattr(training_args, "deepspeed", None):
+        ds_path = training_args.deepspeed
+        logger.info(f"DeepSpeed config path: {ds_path}")
+
+        # Try to resolve relative path if file not found
+        if not os.path.exists(ds_path):
+            # Try relative to this script
+            script_dir = Path(__file__).parent
+            candidate = script_dir / ds_path
+            if candidate.exists():
+                ds_path = str(candidate)
+                logger.info(f"Resolved DeepSpeed config path to: {ds_path}")
+                # Update args so HfDeepSpeedConfig can find it too
+                training_args.deepspeed = ds_path
+
+        try:
+            with open(ds_path, encoding="utf-8") as f:
+                ds_cfg = json.load(f)
+
+            zero_cfg = (
+                ds_cfg.get("zero_optimization", {}) if isinstance(ds_cfg, dict) else {}
+            )
+            try:
+                ds_zero_stage = (
+                    int(zero_cfg.get("stage")) if "stage" in zero_cfg else None
+                )
+            except Exception:
+                ds_zero_stage = None
+
+            logger.info(f"Detected DeepSpeed ZeRO stage: {ds_zero_stage}")
+
+            # Enforce no CPU offload
+            if zero_cfg.get("cpu_offload", False):
+                raise ValueError(
+                    "DeepSpeed config enables cpu_offload=true, which is disallowed."
+                )
+            for key in ("offload_param", "offload_optimizer"):
+                offload = zero_cfg.get(key)
+                if (
+                    isinstance(offload, dict)
+                    and str(offload.get("device", "")).lower() == "cpu"
+                ):
+                    raise ValueError(
+                        f"DeepSpeed config enables {key}.device=cpu, which is disallowed."
+                    )
+        except FileNotFoundError:
+            logger.error(
+                f"DeepSpeed config file not found at: {training_args.deepspeed}"
+            )
+        except Exception as e:
+            logger.error(f"Error parsing DeepSpeed config: {e}")
+
+    # If ZeRO-3 is used, enable partitioned initialization *before* model loading.
+    # Otherwise, each rank may temporarily materialize too many weights on GPU and OOM.
+    hf_ds_config = None
+    if ds_zero_stage == 3 and getattr(training_args, "deepspeed", None):
+        try:
+            try:
+                # transformers>=4.30
+                from transformers.integrations.deepspeed import HfDeepSpeedConfig
+            except Exception:
+                # older transformers
+                from transformers.deepspeed import HfDeepSpeedConfig  # type: ignore
+
+            hf_ds_config = HfDeepSpeedConfig(training_args.deepspeed)
+            logger.info(
+                "Enabled ZeRO-3 partitioned initialization via HfDeepSpeedConfig."
+            )
+            logger.debug(f"HfDeepSpeedConfig loaded: {hf_ds_config}")
+        except Exception as e:
+            logger.warning(
+                f"Failed to enable HfDeepSpeedConfig for ZeRO-3 partitioned init. Model loading may OOM. Error: {e}"
+            )
+    elif getattr(training_args, "deepspeed", None):
+        logger.info(
+            f"ZeRO-3 Init not enabled because stage is {ds_zero_stage} (needs 3)"
+        )
+
+    if remaining:
+        logger.warning(f"Unrecognized arguments (will be ignored): {remaining}")
 
     # Merge all args for convenience
     args = argparse.Namespace(
@@ -392,8 +561,9 @@ def main():
 
     # Set seed
     set_seed(training_args.seed)
+    print_memory_usage("Before model loading")
 
-    # Load model with 4-bit quantization
+    # Load model
     logger.info(f"Loading model from {model_args.model_name_or_path}")
     compute_dtype = (
         torch.float16
@@ -401,23 +571,66 @@ def main():
         else (torch.bfloat16 if training_args.bf16 else torch.float32)
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        device_map="auto",
-        quantization_config=BitsAndBytesConfig(
+    quantization_config = None
+    if model_args.load_in_8bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+    elif model_args.load_in_4bit:
+        quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-        ),
+        )
+
+    # Use DeepSpeed to manage device placement (no quantization)
+    # device_map=None allows DeepSpeed ZeRO to handle model sharding
+    logger.info("Loading model with DeepSpeed ZeRO (no quantization, bf16 precision)")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        device_map=None,  # Let DeepSpeed handle device placement
+        quantization_config=quantization_config
+        if (model_args.load_in_8bit or model_args.load_in_4bit)
+        else None,
         torch_dtype=compute_dtype,
+        low_cpu_mem_usage=True,
         trust_remote_code=model_args.trust_remote_code,
     )
 
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(
-        model, use_gradient_checkpointing=training_args.gradient_checkpointing
-    )
+    # Prepare model for k-bit training (only needed for quantized base model)
+    if model_args.load_in_8bit or model_args.load_in_4bit:
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=training_args.gradient_checkpointing
+        )
+
+        # Verify quantization
+        logger.info("Verifying quantization status...")
+        has_quantized_layers = False
+        for name, module in model.named_modules():
+            if (
+                "Linear8bitLt" in module.__class__.__name__
+                or "Linear4bit" in module.__class__.__name__
+            ):
+                has_quantized_layers = True
+                logger.info(
+                    f"Found quantized layer: {name} -> {module.__class__.__name__}"
+                )
+                break  # Just find one to confirm
+
+        if has_quantized_layers:
+            logger.info("✅ Model successfully loaded with quantization enabled.")
+        else:
+            logger.warning("⚠️ Quantization requested but no quantized layers found!")
+
+    # Freeze Base Model (Correct Implementation for Uni-LoRA)
+    # We must freeze all parameters first. Uni-LoRA application will add new trainable parameters.
+    # The stage configuration later will decide whether to freeze/unfreeze specific parts.
+    logger.info("Freezing base model parameters...")
+    for param in model.parameters():
+        param.requires_grad = False
+    logger.info("Base model frozen.")
 
     # Apply Uni-LoRA to MoE layers
     logger.info("Applying Uni-LoRA to MoE layers...")
@@ -425,6 +638,7 @@ def main():
         model,
         rank=unilora_args.rank,
         alpha=unilora_args.alpha,
+        use_rank1=not unilora_args.use_matrix_mode,
     )
 
     # Load checkpoint if resuming from stage 1
@@ -504,7 +718,6 @@ def main():
     # Create trainer
     trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         **{k: v for k, v in data_module.items() if k != "predict_dataset"},
     )

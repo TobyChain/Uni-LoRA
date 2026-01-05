@@ -4,6 +4,7 @@ Implements parameter-efficient fine-tuning with shared vector bank and expert-sp
 """
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -11,6 +12,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+def _should_use_zero_init() -> bool:
+    """
+    Check if we should use DeepSpeed ZeRO-3 init.
+    Only use it when ZeRO-3 is actually enabled.
+    """
+    try:
+        import deepspeed
+
+        # Check if ZeRO-3 is enabled via environment or config
+        zero_stage = os.environ.get("DEEPSPEED_ZERO_STAGE", "0")
+        if zero_stage == "3":
+            return True
+        # Also check if deepspeed.zero.is_initialized() for ZeRO-3
+        if hasattr(deepspeed, "zero") and hasattr(deepspeed.zero, "is_initialized"):
+            if deepspeed.zero.is_initialized():
+                return True
+    except ImportError:
+        pass
+    return False
 
 
 class UniLoRALinear(nn.Module):
@@ -39,11 +61,22 @@ class UniLoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / rank
 
-        # Shared vector bank (v) - shared across all experts
-        self.register_buffer("shared_vector", shared_vector)
+        # Shared vector bank (v) - shared across ALL experts.
+        # We use a direct assignment instead of register_buffer to ensure
+        # it stays as a reference to the global parameter and is trainable.
+        self.shared_vector = shared_vector
 
         # Expert-specific projection matrix (P_e)
         out_features = base_layer.out_features
+
+        # Place adapter params on the same device as the base layer.
+        # If base weights are quantized (non-floating), fall back to fp16.
+        base_device = getattr(base_layer.weight, "device", None)
+        base_dtype = getattr(base_layer.weight, "dtype", torch.float16)
+        if base_device is None:
+            base_device = torch.device("cpu")
+        if not torch.is_floating_point(torch.empty((), dtype=base_dtype)):
+            base_dtype = torch.float16
 
         # Determine the actual rank for projection
         # If shared_vector is rank-1 (dim=1), then P_e should be (out_features, 1)
@@ -56,8 +89,11 @@ class UniLoRALinear(nn.Module):
             proj_rank = rank
 
         # Initialize P_e with small random values
+        # Only use deepspeed.zero.Init for ZeRO-3, otherwise create normally
         self.projection = nn.Parameter(
-            torch.randn(out_features, proj_rank) * 0.01, requires_grad=True
+            torch.randn(out_features, proj_rank, device=base_device, dtype=base_dtype)
+            * 0.01,
+            requires_grad=True,
         )
 
         self.expert_id = expert_id
@@ -85,12 +121,9 @@ class UniLoRALinear(nn.Module):
             # Rank-1 case: v is a vector (in_features,)
             # v^T @ x: (batch, seq_len, in_features) @ (in_features,) -> (batch, seq_len)
             vx = torch.matmul(x, self.shared_vector)  # (batch, seq_len)
-            # P_e is (out_features, 1), so we need to expand vx and multiply
-            vx_expanded = vx.unsqueeze(-1)  # (batch, seq_len, 1)
-            # P_e.t() @ vx: (1, out_features) @ (batch, seq_len, 1) -> (batch, seq_len, out_features)
-            adaptation = self.scaling * torch.matmul(
-                vx_expanded, self.projection.t()
-            )  # (batch, seq_len, out_features)
+            # P_e is (out_features, 1). We can use broadcasting for efficiency.
+            # (batch, seq_len, 1) * (1, 1, out_features) -> (batch, seq_len, out_features)
+            adaptation = self.scaling * (vx.unsqueeze(-1) * self.projection.t())
         else:
             # Low-rank case: v is a matrix (rank, in_features)
             # v^T @ x: (rank, in_features) @ (batch, seq_len, in_features) -> (batch, seq_len, rank)
@@ -152,6 +185,175 @@ class UniLoRAMoEExpert(nn.Module):
         return output
 
 
+class UniLoRAQwen2MoeExperts(nn.Module):
+    """
+    Wrapper for Qwen2MoeExperts (fused experts) with Uni-LoRA applied.
+    """
+
+    def __init__(
+        self,
+        experts: nn.Module,
+        rank: int,
+        alpha: float,
+        shared_vector: nn.Parameter,
+    ):
+        super().__init__()
+        self.experts = experts
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        self.shared_vector = shared_vector
+
+        self.num_experts = experts.num_experts
+        self.hidden_dim = experts.hidden_dim
+        self.intermediate_dim = experts.intermediate_dim
+        self.act_fn = experts.act_fn
+
+        # Create adapters for gate_up_proj
+        # gate_up_proj is (num_experts, 2*intermediate, hidden)
+        # We need P_e: (2*intermediate, rank) for each expert
+
+        base_device = experts.gate_up_proj.device
+        base_dtype = experts.gate_up_proj.dtype
+        if not torch.is_floating_point(torch.empty((), dtype=base_dtype)):
+            base_dtype = torch.float16
+
+        proj_rank = 1 if shared_vector.dim() == 1 else rank
+
+        # Create adapter parameters directly (no ZeRO-3 init for ZeRO-2 mode)
+        self.gate_up_projections = nn.Parameter(
+            torch.randn(
+                self.num_experts,
+                2 * self.intermediate_dim,
+                proj_rank,
+                device=base_device,
+                dtype=base_dtype,
+            )
+            * 0.01,
+            requires_grad=True,
+        )
+
+        # For down_proj, input is intermediate_dim. Shared vector is hidden_dim.
+        # If dimensions differ, we cannot apply Uni-LoRA with the same shared vector.
+        # We will skip down_proj adaptation if dimensions differ.
+        if self.intermediate_dim == self.hidden_dim:
+            self.down_projections = nn.Parameter(
+                torch.randn(
+                    self.num_experts,
+                    self.hidden_dim,
+                    proj_rank,
+                    device=base_device,
+                    dtype=base_dtype,
+                )
+                * 0.01,
+                requires_grad=True,
+            )
+        else:
+            self.down_projections = None
+            logger.warning(
+                f"Skipping Uni-LoRA for down_proj because intermediate_dim ({self.intermediate_dim}) != hidden_dim ({self.hidden_dim})"
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        # Compute shared vector projection once
+        # v^T @ x
+        if self.shared_vector.dim() == 1:
+            vx = torch.matmul(hidden_states, self.shared_vector)  # (batch, seq_len)
+        else:
+            vx = torch.matmul(
+                hidden_states, self.shared_vector.t()
+            )  # (batch, seq_len, rank)
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index, num_classes=self.num_experts
+            )
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+
+            # Base gate_up
+            base_gate_up = nn.functional.linear(
+                current_state, self.experts.gate_up_proj[expert_idx]
+            )
+
+            # Adapter gate_up
+            current_vx = vx[token_idx]  # (num_tokens,) or (num_tokens, rank)
+
+            if self.shared_vector.dim() == 1:
+                # adaptation = scaling * (vx.unsqueeze(-1) * P_e.t())
+                # P_e is (2*intermediate, 1) -> t() -> (1, 2*intermediate)
+                # vx is (num_tokens,) -> unsqueeze(-1) -> (num_tokens, 1)
+                # result: (num_tokens, 2*intermediate)
+                adapter_gate_up = self.scaling * (
+                    current_vx.unsqueeze(-1) * self.gate_up_projections[expert_idx].t()
+                )
+            else:
+                # adaptation = scaling * vx @ P_e.t()
+                # vx: (num_tokens, rank)
+                # P_e: (2*intermediate, rank) -> t() -> (rank, 2*intermediate)
+                adapter_gate_up = self.scaling * torch.matmul(
+                    current_vx, self.gate_up_projections[expert_idx].t()
+                )
+
+            gate_up = base_gate_up + adapter_gate_up
+            gate, up = gate_up.chunk(2, dim=-1)
+
+            current_hidden_states = self.act_fn(gate) * up
+
+            # Down proj
+            base_down = nn.functional.linear(
+                current_hidden_states, self.experts.down_proj[expert_idx]
+            )
+
+            if self.down_projections is not None:
+                # We need to compute vx for current_hidden_states?
+                # NO! Uni-LoRA uses the SAME shared vector v.
+                # But v expects input of size hidden_dim.
+                # current_hidden_states has size intermediate_dim.
+                # So we CANNOT use v here unless intermediate_dim == hidden_dim.
+                # Since we checked in __init__, if we are here, they are equal.
+
+                if self.shared_vector.dim() == 1:
+                    vx_down = torch.matmul(current_hidden_states, self.shared_vector)
+                    adapter_down = self.scaling * (
+                        vx_down.unsqueeze(-1) * self.down_projections[expert_idx].t()
+                    )
+                else:
+                    vx_down = torch.matmul(
+                        current_hidden_states, self.shared_vector.t()
+                    )
+                    adapter_down = self.scaling * torch.matmul(
+                        vx_down, self.down_projections[expert_idx].t()
+                    )
+
+                current_hidden_states = base_down + adapter_down
+            else:
+                current_hidden_states = base_down
+
+            current_hidden_states = (
+                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            )
+            final_hidden_states.index_add_(
+                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+            )
+
+        return final_hidden_states
+
+
 class UniLoRAMoELayer(nn.Module):
     """
     Wrapper for Qwen MoE SparseMoeBlock that applies Uni-LoRA to all experts.
@@ -171,30 +373,61 @@ class UniLoRAMoELayer(nn.Module):
         self.alpha = alpha
 
         # Store reference to shared vector
-        self.register_buffer("shared_vector", shared_vector)
+        self.shared_vector = shared_vector
 
         # Get the number of experts
         if hasattr(moe_block, "num_experts"):
             self.num_experts = moe_block.num_experts
         elif hasattr(moe_block, "experts") and hasattr(moe_block.experts, "__len__"):
             self.num_experts = len(moe_block.experts)
+        elif hasattr(moe_block, "experts") and hasattr(
+            moe_block.experts, "num_experts"
+        ):
+            self.num_experts = moe_block.experts.num_experts
         else:
             raise ValueError("Cannot determine number of experts from MoE block")
 
         # Replace each expert with UniLoRAMoEExpert
         if hasattr(moe_block, "experts"):
-            self.experts = nn.ModuleList(
-                [
-                    UniLoRAMoEExpert(
-                        expert=expert,
-                        rank=rank,
-                        alpha=alpha,
-                        shared_vector=shared_vector,
-                        expert_id=i,
+            if isinstance(moe_block.experts, nn.ModuleList):
+                self.experts = nn.ModuleList(
+                    [
+                        UniLoRAMoEExpert(
+                            expert=expert,
+                            rank=rank,
+                            alpha=alpha,
+                            shared_vector=shared_vector,
+                            expert_id=i,
+                        )
+                        for i, expert in enumerate(moe_block.experts)
+                    ]
+                )
+            elif moe_block.experts.__class__.__name__ == "Qwen2MoeExperts":
+                self.experts = UniLoRAQwen2MoeExperts(
+                    experts=moe_block.experts,
+                    rank=rank,
+                    alpha=alpha,
+                    shared_vector=shared_vector,
+                )
+            else:
+                # Fallback for other types if they are iterable
+                try:
+                    self.experts = nn.ModuleList(
+                        [
+                            UniLoRAMoEExpert(
+                                expert=expert,
+                                rank=rank,
+                                alpha=alpha,
+                                shared_vector=shared_vector,
+                                expert_id=i,
+                            )
+                            for i, expert in enumerate(moe_block.experts)
+                        ]
                     )
-                    for i, expert in enumerate(moe_block.experts)
-                ]
-            )
+                except TypeError:
+                    raise ValueError(
+                        f"Unsupported experts type: {type(moe_block.experts)}"
+                    )
         else:
             raise ValueError("MoE block does not have 'experts' attribute")
 
@@ -228,6 +461,7 @@ def apply_unilora_to_qwen_moe(
     rank: int = 64,
     alpha: float = 16.0,
     target_modules: Optional[list] = None,
+    use_rank1: bool = True,
 ) -> nn.Module:
     """
     Apply Uni-LoRA to Qwen MoE model by replacing MoE layers.
@@ -237,6 +471,7 @@ def apply_unilora_to_qwen_moe(
         rank: Rank of the low-rank adaptation (r)
         alpha: Scaling factor (alpha)
         target_modules: List of module names to target (default: all MoE blocks)
+        use_rank1: Whether to use rank-1 shared vector (default: True)
 
     Returns:
         Modified model with Uni-LoRA applied
@@ -245,17 +480,23 @@ def apply_unilora_to_qwen_moe(
     # For rank-1: shared_vector is (in_features,)
     # For low-rank: shared_vector is (rank, in_features)
     # We'll use rank-1 for simplicity and memory efficiency
-    use_rank1 = True
+    # use_rank1 = True
 
     # Find a reference layer to get dimensions
     in_features = None
     for name, module in model.named_modules():
-        if "moe" in name.lower() and hasattr(module, "experts"):
-            if len(module.experts) > 0:
+        if hasattr(module, "experts"):
+            if isinstance(module.experts, nn.ModuleList) and len(module.experts) > 0:
                 first_expert = module.experts[0]
                 if hasattr(first_expert, "gate_proj"):
                     in_features = first_expert.gate_proj.in_features
                     break
+            elif module.experts.__class__.__name__ == "Qwen2MoeExperts":
+                in_features = module.experts.hidden_dim
+                break
+            elif hasattr(module.experts, "hidden_dim"):
+                in_features = module.experts.hidden_dim
+                break
 
     if in_features is None:
         raise ValueError(
@@ -263,16 +504,46 @@ def apply_unilora_to_qwen_moe(
         )
 
     # Create global shared vector bank
+    # Create shared vector directly (no ZeRO-3 init needed for ZeRO-2 mode)
     if use_rank1:
-        # Rank-1: single vector shared across all experts
         shared_vector = nn.Parameter(
             torch.randn(in_features) * 0.01, requires_grad=True
         )
     else:
-        # Low-rank: matrix shared across all experts
         shared_vector = nn.Parameter(
             torch.randn(rank, in_features) * 0.01, requires_grad=True
         )
+
+    # Place shared vector on the same device/dtype as a reference expert weight (avoid CPU placement)
+    ref_device = None
+    ref_dtype = None
+    try:
+        for name, module in model.named_modules():
+            if ("moe" in name.lower() or "sparse_moe" in name.lower()) and hasattr(
+                module, "experts"
+            ):
+                if (
+                    isinstance(module.experts, nn.ModuleList)
+                    and len(module.experts) > 0
+                ):
+                    if hasattr(module.experts[0], "gate_proj"):
+                        ref_device = module.experts[0].gate_proj.weight.device
+                        ref_dtype = module.experts[0].gate_proj.weight.dtype
+                        break
+                elif module.experts.__class__.__name__ == "Qwen2MoeExperts":
+                    ref_device = module.experts.gate_up_proj.device
+                    ref_dtype = module.experts.gate_up_proj.dtype
+                    break
+    except Exception:
+        ref_device = None
+        ref_dtype = None
+
+    if ref_device is not None:
+        if ref_dtype is None or not torch.is_floating_point(
+            torch.empty((), dtype=ref_dtype)
+        ):
+            ref_dtype = torch.float16
+        shared_vector.data = shared_vector.data.to(device=ref_device, dtype=ref_dtype)
 
     # Register shared vector as a model-level parameter
     model.register_parameter("unilora_shared_vector", shared_vector)
@@ -345,6 +616,17 @@ def freeze_unilora_adapters(model: nn.Module, freeze: bool = True):
         if isinstance(module, UniLoRALinear):
             if hasattr(module, "projection"):
                 module.projection.requires_grad = not freeze
+            logger.debug(
+                f"{'Frozen' if freeze else 'Unfrozen'} Uni-LoRA adapter in {name}"
+            )
+        elif isinstance(module, UniLoRAQwen2MoeExperts):
+            if hasattr(module, "gate_up_projections"):
+                module.gate_up_projections.requires_grad = not freeze
+            if (
+                hasattr(module, "down_projections")
+                and module.down_projections is not None
+            ):
+                module.down_projections.requires_grad = not freeze
             logger.debug(
                 f"{'Frozen' if freeze else 'Unfrozen'} Uni-LoRA adapter in {name}"
             )
