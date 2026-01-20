@@ -1,6 +1,11 @@
 # 输出目录
-output/
+output/*
+!output/.gitkeep
 test_results/
+
+# swanlog
+swanlog/*
+!swanlog/.gitkeep
 
 # Python 缓存
 __pycache__/

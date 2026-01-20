@@ -6,8 +6,11 @@
 
 set -euo pipefail
 
+# Configure proxy settings to bypass proxy for SwanLab (resolves connection issues)
+export no_proxy="${no_proxy:-},swanlab.cn,api.swanlab.cn"
+
 # === Configuration ===
-MODEL_NAME=${1:-"Qwen/Qwen1.5-MoE-A2.7B-Chat"}
+MODEL_NAME=${1:-"/root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat"}
 DATASET=${2:-"alpaca-clean"}
 OUTPUT_BASE_DIR=${3:-"./output/qwen_moe_unilora_pipeline"}
 
@@ -15,12 +18,12 @@ OUTPUT_BASE_DIR=${3:-"./output/qwen_moe_unilora_pipeline"}
 LORA_R=64
 LORA_ALPHA=16.0
 USE_RANK1=True  # Use rank-1 shared vector for memory efficiency
-BITS=16  # No quantization (using bf16 + ZeRO-3 instead)
+BITS=16  # 16-bit (BF16) for higher precision
 
-# Training Hyperparameters (optimized for 2x 24GB GPUs with ZeRO-3)
-NUM_GPUS=2
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=24
+# Training Hyperparameters (optimized for single A100-40GB with BF16)
+NUM_GPUS=1
+PER_DEVICE_TRAIN_BATCH_SIZE=4  # Increased to 4 to utilize remaining 9GB VRAM
+GRADIENT_ACCUMULATION_STEPS=8  # Reduced to maintain effective batch size of 32
 LEARNING_RATE=2e-4
 LEARNING_RATE_VECTOR_BANK=1e-3
 NUM_TRAIN_EPOCHS=3
@@ -55,20 +58,9 @@ else
     echo "Using pre-set GPUs: $CUDA_VISIBLE_DEVICES"
 fi
 
-# DeepSpeed ZeRO-3 Config
-DS_CONFIG="../configs/ds_config_zero3.json"
-if [ ! -f "$DS_CONFIG" ]; then
-    echo "Warning: DeepSpeed config not found at $DS_CONFIG. Checking current directory..."
-    if [ -f "ds_config_zero3.json" ]; then
-        DS_CONFIG="ds_config_zero3.json"
-    else
-        SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-        if [ -f "$SCRIPT_DIR/../configs/ds_config_zero3.json" ]; then
-             DS_CONFIG="$SCRIPT_DIR/../configs/ds_config_zero3.json"
-        fi
-    fi
-fi
-echo "Using DeepSpeed Config: $DS_CONFIG"
+# DeepSpeed not needed for single GPU training
+# DS_CONFIG="../configs/ds_config_zero3.json"
+echo "Single GPU training mode - DeepSpeed disabled"
 
 # Environment Setup
 export MASTER_ADDR=127.0.0.1
@@ -95,13 +87,12 @@ echo ""
 
 OUTPUT_DIR_S1="${OUTPUT_BASE_DIR}/stage1"
 
-# Launch with deepspeed
-/data2/guanbingtao/miniforge3/envs/instruction_tuning/bin/deepspeed --master_port=29505 --include localhost:${CUDA_VISIBLE_DEVICES} train_unilora_moe.py \
+# Launch with python (single GPU, no DeepSpeed)
+python train_unilora_moe.py \
     --model_name_or_path ${MODEL_NAME} \
     --trust_remote_code \
     --dataset ${DATASET} \
     --output_dir ${OUTPUT_DIR_S1} \
-    --deepspeed ${DS_CONFIG} \
     --do_train \
     --do_eval \
     --bf16 \
@@ -147,12 +138,11 @@ echo ""
 
 OUTPUT_DIR_S2="${OUTPUT_BASE_DIR}/stage2"
 
-/data2/guanbingtao/miniforge3/envs/instruction_tuning/bin/deepspeed --master_port=29505 --include localhost:${CUDA_VISIBLE_DEVICES} train_unilora_moe.py \
+python train_unilora_moe.py \
     --model_name_or_path ${MODEL_NAME} \
     --trust_remote_code \
     --dataset ${DATASET} \
     --output_dir ${OUTPUT_DIR_S2} \
-    --deepspeed ${DS_CONFIG} \
     --do_train \
     --do_eval \
     --bf16 \

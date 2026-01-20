@@ -3,8 +3,6 @@ Training script for Qwen MoE with Uni-LoRA
 Supports two-stage training:
   Stage 1: Train expert adapters (freeze router)
   Stage 2: Train router (freeze adapters)
-
-Based on qlora_unilora.py implementation, adapted for Qwen MoE architecture with DeepSpeed ZeRO-3.
 """
 
 import argparse
@@ -20,8 +18,9 @@ from typing import Dict, Optional, Sequence
 import pandas as pd
 import torch
 import transformers
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -33,12 +32,21 @@ from transformers.trainer_pt_utils import get_parameter_names
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
-# Add modeling directory to path
+try:
+    import swanlab
+
+    SWANLAB_AVAILABLE = False  # Force disable SwanLab to avoid connection errors
+except ImportError:
+    SWANLAB_AVAILABLE = False
+    print("SwanLab not available. Training will proceed without SwanLab integration.")
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "modeling"))
-from modeling_unilora_moe import (  # pyright: ignore[reportMissingImports]
+from modeling_unilora_moe import (
     apply_unilora_to_qwen_moe,
+    apply_unilora_to_attention,
     freeze_router,
     freeze_unilora_adapters,
+    freeze_attention_adapters,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,21 +116,47 @@ class UniLoRAArguments:
     lora_dropout: float = field(default=0.0, metadata={"help": "Uni-LoRA dropout."})
 
     training_stage: int = field(
-        default=1,
-        metadata={"help": "Training stage: 1 (train adapters) or 2 (train router)"},
+        default=0,
+        metadata={
+            "help": "Training stage: 0 (joint training), 1 (train adapters), or 2 (train router)"
+        },
     )
     use_rank1: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Use rank-1 shared vector (True) or low-rank matrix (False)"},
     )
+    shared_vector_rank: int = field(
+        default=8,
+        metadata={"help": "Rank of shared vector when use_rank1=False"},
+    )
+    learning_rate_router: float = field(
+        default=1e-5,
+        metadata={"help": "Learning rate for router (gate) parameters"},
+    )
+    load_balancing_coef: float = field(
+        default=0.01,
+        metadata={"help": "Coefficient for load balancing auxiliary loss"},
+    )
+    train_attention: bool = field(
+        default=False,
+        metadata={"help": "Whether to apply Uni-LoRA to attention layers (Q/K/V)"},
+    )
+    freeze_moe: bool = field(
+        default=False,
+        metadata={
+            "help": "Freeze MoE experts and router (for attention-only training)"
+        },
+    )
+    attn_shared_vector_rank: int = field(
+        default=8,
+        metadata={"help": "Rank of shared vector for attention adapters"},
+    )
 
-    # Vector bank specific learning rate (following qlora_unilora.py)
     learning_rate_vector_bank: float = field(
         default=1e-3,
         metadata={"help": "Learning rate for shared vector bank"},
     )
 
-    # Quantization options (following qlora_unilora.py)
     bits: int = field(
         default=16,
         metadata={"help": "Quantization bits: 4, 8, or 16 (no quantization)"},
@@ -157,14 +191,12 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
         metadata={"help": "Use 8-bit Adam optimizer"},
     )
 
-    # Compatibility for older scripts
     evaluation_strategy: Optional[str] = field(
         default=None,
         metadata={"help": "Alias for eval_strategy (compat)."},
     )
 
     def __post_init__(self):
-        # Handle evaluation_strategy alias
         if self.evaluation_strategy is not None:
             current = getattr(self, "eval_strategy", None)
             if current is None or str(current) == "no":
@@ -174,7 +206,6 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
         if current is not None and str(current) != "no" and not self.do_eval:
             self.do_eval = True
 
-        # Fix dataset column issue
         self.remove_unused_columns = False
 
         super().__post_init__()
@@ -185,7 +216,7 @@ def smart_tokenizer_and_embedding_resize(
     tokenizer: transformers.PreTrainedTokenizer,
     model: transformers.PreTrainedModel,
 ):
-    """Resize tokenizer and embedding (from qlora_unilora.py)"""
+    """Resize tokenizer and embedding"""
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
 
@@ -206,7 +237,7 @@ def smart_tokenizer_and_embedding_resize(
 
 @dataclass
 class DataCollatorForCausalLM:
-    """Data collator for causal language modeling (from qlora_unilora.py)"""
+    """Data collator for causal language modeling"""
 
     tokenizer: transformers.PreTrainedTokenizer
     source_max_len: int
@@ -274,7 +305,6 @@ class DataCollatorForCausalLM:
         return data_dict
 
 
-# Dataset formatting functions (from qlora_unilora.py)
 ALPACA_PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
@@ -301,7 +331,7 @@ def extract_alpaca_dataset(example):
 def local_dataset(dataset_name):
     """Load local dataset"""
     if dataset_name.endswith(".json") or dataset_name.endswith(".jsonl"):
-        full_dataset = Dataset.from_json(path_or_paths=dataset_name)
+        full_dataset = load_dataset("json", data_files=dataset_name, split="train")
     elif dataset_name.endswith(".csv"):
         full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name))
     elif dataset_name.endswith(".tsv"):
@@ -314,7 +344,7 @@ def local_dataset(dataset_name):
 
 
 def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
-    """Make dataset and collator for supervised fine-tuning (from qlora_unilora.py)"""
+    """Make dataset and collator for supervised fine-tuning"""
 
     def load_data(dataset_name):
         if dataset_name == "alpaca":
@@ -374,7 +404,6 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         elif dataset_format == "input-output":
             pass
 
-        # Remove unused columns
         try:
             dataset = dataset.remove_columns(
                 [
@@ -383,7 +412,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                     if col not in ["input", "output"]
                 ]
             )
-        except:  # For single dataset (not DatasetDict)  # noqa: E722
+        except:  # noqa: E722
             pass
 
         return dataset
@@ -391,7 +420,6 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     dataset = load_data(args.dataset)
     dataset = format_dataset(dataset, args.dataset_format)
 
-    # Split train/eval
     if args.do_eval or args.do_predict:
         if "eval" in dataset:
             eval_dataset = dataset["eval"]
@@ -442,7 +470,6 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
 def create_optimizer(model, args) -> torch.optim.Optimizer:
     """
     Create optimizer with separate learning rates for vector bank and other parameters.
-    Based on qlora_unilora.py implementation.
     """
     decay_parameters = get_parameter_names(model, ALL_LAYERNORM_LAYERS)
     decay_parameters = [name for name in decay_parameters if "bias" not in name]
@@ -457,6 +484,12 @@ def create_optimizer(model, args) -> torch.optim.Optimizer:
         if "projection" in name or "projections" in name
     ]
 
+    router_parameters = [
+        name
+        for name, _ in model.named_parameters()
+        if "gate" in name.lower() and "gate_proj" not in name.lower()
+    ]
+
     optimizer_grouped_parameters = [
         {
             "params": [
@@ -465,6 +498,7 @@ def create_optimizer(model, args) -> torch.optim.Optimizer:
                 if n in decay_parameters
                 and n not in vector_bank_parameters
                 and n not in projection_parameters
+                and n not in router_parameters
             ],
             "weight_decay": args.weight_decay,
         },
@@ -475,6 +509,7 @@ def create_optimizer(model, args) -> torch.optim.Optimizer:
                 if n not in decay_parameters
                 and n not in vector_bank_parameters
                 and n not in projection_parameters
+                and n not in router_parameters
             ],
             "weight_decay": 0.0,
         },
@@ -492,12 +527,18 @@ def create_optimizer(model, args) -> torch.optim.Optimizer:
             "lr": args.learning_rate,
             "weight_decay": 0.0,
         },
+        {
+            "params": [
+                p for n, p in model.named_parameters() if n in router_parameters
+            ],
+            "lr": getattr(args, "learning_rate_router", 1e-5),
+            "weight_decay": 0.0,
+        },
     ]
 
     optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(args)
     optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
-    # Handle 8-bit Adam if requested
     if args.adam8bit:
         try:
             import bitsandbytes as bnb
@@ -522,7 +563,6 @@ def create_optimizer(model, args) -> torch.optim.Optimizer:
 class SaveUniLoRACallback(transformers.TrainerCallback):
     """
     Callback to save Uni-LoRA specific parameters.
-    Based on SavePeftModelCallback from qlora_unilora.py.
     """
 
     def save_model(self, args, state, kwargs):
@@ -538,12 +578,10 @@ class SaveUniLoRACallback(transformers.TrainerCallback):
 
         model = kwargs["model"]
 
-        # Save Uni-LoRA specific parameters
         if hasattr(model, "unilora_shared_vector"):
             unilora_params = {
                 "unilora_shared_vector": model.unilora_shared_vector.data,
             }
-            # Collect all projection parameters
             for name, param in model.named_parameters():
                 if "projection" in name or "projections" in name:
                     unilora_params[name] = param.data
@@ -567,10 +605,75 @@ class SaveUniLoRACallback(transformers.TrainerCallback):
         self.save_model(args, state, kwargs)
 
 
+class UniLoRATrainer(Trainer):
+    """
+    Custom Trainer that handles saving models with shared tensors (Uni-LoRA).
+    """
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Saving model checkpoint to {output_dir}")
+
+        supported_classes = (transformers.PreTrainedModel,)
+
+        save_on_each_node = self.args.save_on_each_node or self.args.should_save
+
+        if self.args.should_save:
+            self._rotate_checkpoints(use_mtime=True, output_dir=self.args.output_dir)
+
+        if self.args.should_save and save_on_each_node:
+            self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+
+        if self.args.should_save:
+            self.save_state()
+
+        fsdp = getattr(self, "fsdp", False)
+        deepspeed = getattr(self, "deepspeed", False)
+
+        if fsdp or deepspeed:
+            if self.args.should_save:
+                state_dict = self.model.state_dict()
+                if self.args.should_save:
+                    self._save(output_dir, state_dict=state_dict)
+        elif self.args.should_save:
+            if hasattr(self.model, "unilora_shared_vector"):
+                logger.info(
+                    "Detected Uni-LoRA model with shared tensors. Skipping model weight save."
+                )
+                logger.info("Uni-LoRA parameters will be saved by SaveUniLoRACallback.")
+                # Save config file for checkpoint validation
+                if isinstance(self.model, supported_classes):
+                    self.model.config.save_pretrained(output_dir)
+                # Create empty pytorch_model.bin for checkpoint validation
+                torch.save({}, os.path.join(output_dir, "pytorch_model.bin"))
+                logger.info("Created empty pytorch_model.bin for checkpoint validation.")
+            else:
+                if isinstance(self.model, supported_classes):
+                    self.model.save_pretrained(
+                        output_dir,
+                        state_dict=state_dict,
+                        safe_serialization=self.args.save_safetensors,
+                    )
+                else:
+                    logger.info(
+                        "Trainer.model is not a `PreTrainedModel`, only saving its state dict."
+                    )
+                    if state_dict is None:
+                        state_dict = self.model.state_dict()
+                    torch.save(
+                        state_dict, os.path.join(output_dir, "pytorch_model.bin")
+                    )
+
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(output_dir)
+
+            torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+
 def print_trainable_parameters(args, model):
     """
     Print the number of trainable parameters in the model.
-    From qlora_unilora.py.
     """
     trainable_params = 0
     all_param = 0
@@ -583,7 +686,6 @@ def print_trainable_parameters(args, model):
             )
             trainable_params += num
 
-    # Adjust for quantization
     if args.bits == 4:
         trainable_params /= 2
 
@@ -595,11 +697,11 @@ def print_trainable_parameters(args, model):
 
 
 def get_last_checkpoint(checkpoint_dir):
-    """Get the last checkpoint from a directory (from qlora_unilora.py)"""
+    """Get the last checkpoint from a directory"""
     if os.path.isdir(checkpoint_dir):
         is_completed = os.path.exists(os.path.join(checkpoint_dir, "completed"))
         if is_completed:
-            return None, True  # already finished
+            return None, True
         max_step = 0
         for filename in os.listdir(checkpoint_dir):
             if os.path.isdir(
@@ -607,11 +709,11 @@ def get_last_checkpoint(checkpoint_dir):
             ) and filename.startswith("checkpoint"):
                 max_step = max(max_step, int(filename.replace("checkpoint-", "")))
         if max_step == 0:
-            return None, is_completed  # training started, but no checkpoint
+            return None, is_completed
         checkpoint_dir = os.path.join(checkpoint_dir, f"checkpoint-{max_step}")
         logger.info(f"Found a previous checkpoint at: {checkpoint_dir}")
-        return checkpoint_dir, is_completed  # checkpoint found!
-    return None, False  # first training
+        return checkpoint_dir, is_completed
+    return None, False
 
 
 def main():
@@ -625,7 +727,6 @@ def main():
     if remaining:
         logger.warning(f"Unrecognized arguments (will be ignored): {remaining}")
 
-    # Merge args for convenience
     args = argparse.Namespace(
         **vars(model_args),
         **vars(data_args),
@@ -633,7 +734,6 @@ def main():
         **vars(training_args),
     )
 
-    # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -645,13 +745,11 @@ def main():
         f"Uni-LoRA parameters: rank={unilora_args.lora_r}, alpha={unilora_args.lora_alpha}, stage={unilora_args.training_stage}"
     )
 
-    # DeepSpeed ZeRO-3 handling
     ds_zero_stage = None
     if getattr(training_args, "deepspeed", None):
         ds_path = training_args.deepspeed
         logger.info(f"DeepSpeed config path: {ds_path}")
 
-        # Resolve relative path
         if not os.path.exists(ds_path):
             script_dir = Path(__file__).parent
             candidate = script_dir / ds_path
@@ -678,12 +776,10 @@ def main():
         except Exception as e:
             logger.error(f"Error parsing DeepSpeed config: {e}")
 
-    # ZeRO-3 initialization (following qlora_unilora.py pattern)
     if ds_zero_stage == 3 and getattr(training_args, "deepspeed", None):
         try:
             from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
-            # Initialize DeepSpeed config (no need to keep reference)
             _ = HfDeepSpeedConfig(training_args.deepspeed)
             logger.info(
                 "Enabled ZeRO-3 partitioned initialization via HfDeepSpeedConfig."
@@ -691,16 +787,13 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to enable HfDeepSpeedConfig for ZeRO-3: {e}")
 
-    # Set seed
     set_seed(training_args.seed)
 
-    # Check for existing checkpoint
     checkpoint_dir, completed_training = get_last_checkpoint(training_args.output_dir)
     if completed_training:
         logger.info("Detected that training was already completed!")
         return
 
-    # Load model
     logger.info(f"Loading model from {model_args.model_name_or_path}")
     compute_dtype = (
         torch.float16
@@ -708,7 +801,6 @@ def main():
         else (torch.bfloat16 if training_args.bf16 else torch.float32)
     )
 
-    # Quantization config (following qlora_unilora.py)
     quantization_config = None
     if unilora_args.bits == 4:
         quantization_config = BitsAndBytesConfig(
@@ -724,19 +816,15 @@ def main():
     else:
         logger.info("Using full precision (bf16/fp16)")
 
-    # Device map for ZeRO
     device_map = None
     max_memory = None
     if ds_zero_stage == 3:
-        # ZeRO-3 handles device placement
         device_map = None
     elif os.environ.get("LOCAL_RANK") is not None:
-        # Distributed but not ZeRO-3
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         device_map = {"": local_rank}
         max_memory = {local_rank: f"{unilora_args.max_memory_MB}MB"}
     else:
-        # Single GPU or auto
         device_map = "auto"
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -750,21 +838,19 @@ def main():
         low_cpu_mem_usage=True,
     )
 
-    # Freeze base model (critical for Uni-LoRA)
     logger.info("Freezing base model parameters...")
     for param in model.parameters():
         param.requires_grad = False
 
-    # Apply Uni-LoRA
     logger.info("Applying Uni-LoRA to MoE layers...")
     model = apply_unilora_to_qwen_moe(
         model,
         rank=unilora_args.lora_r,
         alpha=unilora_args.lora_alpha,
         use_rank1=unilora_args.use_rank1,
+        shared_vector_rank=unilora_args.shared_vector_rank,
     )
 
-    # Load checkpoint if resuming from Stage 1
     if unilora_args.training_stage == 2:
         stage1_output_dir = os.path.join(training_args.output_dir, "..", "stage1")
         if os.path.exists(stage1_output_dir):
@@ -780,15 +866,19 @@ def main():
                         model.unilora_shared_vector.data = unilora_params[
                             "unilora_shared_vector"
                         ]
-                    # Load projection parameters
                     for name, param in model.named_parameters():
                         if name in unilora_params:
                             param.data = unilora_params[name]
                     logger.info("Loaded Uni-LoRA parameters from Stage 1")
 
-    # Configure training stage
     logger.info(f"Training Stage: {unilora_args.training_stage}")
-    if unilora_args.training_stage == 1:
+    if unilora_args.training_stage == 0:
+        logger.info(
+            "Stage 0 (Joint Training): Training BOTH Router and Uni-LoRA adapters"
+        )
+        freeze_router(model, freeze=False)
+        freeze_unilora_adapters(model, freeze=False)
+    elif unilora_args.training_stage == 1:
         logger.info("Stage 1: Freezing router, training Uni-LoRA adapters")
         freeze_router(model, freeze=True)
         freeze_unilora_adapters(model, freeze=False)
@@ -798,10 +888,27 @@ def main():
         freeze_unilora_adapters(model, freeze=True)
     else:
         raise ValueError(
-            f"Invalid training stage: {unilora_args.training_stage}. Must be 1 or 2."
+            f"Invalid training stage: {unilora_args.training_stage}. Must be 0, 1 or 2."
         )
 
-    # Tokenizer
+    # Handle freeze_moe option (for attention-only training)
+    if unilora_args.freeze_moe:
+        logger.info("Freezing MoE experts and router for attention-only training...")
+        freeze_router(model, freeze=True)
+        freeze_unilora_adapters(model, freeze=True)
+
+    # Apply Uni-LoRA to attention layers if requested
+    if unilora_args.train_attention:
+        logger.info("Applying Uni-LoRA to attention layers (Q/K/V)...")
+        model = apply_unilora_to_attention(
+            model,
+            rank=unilora_args.lora_r,
+            alpha=unilora_args.lora_alpha,
+            shared_vector_rank=unilora_args.attn_shared_vector_rank,
+        )
+        freeze_attention_adapters(model, freeze=False)
+        logger.info("Attention Uni-LoRA adapters enabled for training")
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=model_args.trust_remote_code,
@@ -817,7 +924,6 @@ def main():
             model=model,
         )
 
-    # Special token handling for Qwen models
     if "qwen" in model_args.model_name_or_path.lower():
         logger.info("Detected Qwen model, configuring special tokens")
         if tokenizer.eos_token is None:
@@ -831,28 +937,72 @@ def main():
 
     model.config.use_cache = False
 
-    # Print trainable parameters
     logger.info("Trainable parameters:")
     print_trainable_parameters(args, model)
 
-    # Prepare data
+    if training_args.gradient_checkpointing:
+        logger.info("Enabling gradient checkpointing and input gradients...")
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
     data_module = make_data_module(tokenizer=tokenizer, args=args)
 
-    # Create optimizer with separate learning rates
     optimizer = create_optimizer(model, args)
 
-    # Create trainer
-    trainer = Trainer(
+    # Hack: Temporarily disable quantization flags to bypass Trainer check
+    # Transformers Trainer prevents fine-tuning purely quantized models unless they are PeftModels
+    # Since we use custom Uni-LoRA adapters, we need to bypass this check
+    _is_8bit = getattr(model, "is_loaded_in_8bit", False)
+    _is_4bit = getattr(model, "is_loaded_in_4bit", False)
+    if _is_8bit:
+        model.is_loaded_in_8bit = False
+    if _is_4bit:
+        model.is_loaded_in_4bit = False
+
+    trainer = UniLoRATrainer(
         model=model,
         args=training_args,
         optimizers=(optimizer, None),
         **{k: v for k, v in data_module.items() if k != "predict_dataset"},
     )
 
-    # Add callback
+    # Restore flags
+    if _is_8bit:
+        model.is_loaded_in_8bit = True
+    if _is_4bit:
+        model.is_loaded_in_4bit = True
+
     trainer.add_callback(SaveUniLoRACallback)
 
-    # Training
+    # Add SwanLab integration
+    if SWANLAB_AVAILABLE:
+        swanlab.init(
+            project="Uni-LoRA-Qwen-MoE",
+            experiment_name=f"{unilora_args.training_stage}_stage_lr{training_args.learning_rate}_bs{training_args.per_device_train_batch_size}",
+            config={
+                "model": model_args.model_name_or_path,
+                "dataset": data_args.dataset,
+                "training_stage": unilora_args.training_stage,
+                "lora_r": unilora_args.lora_r,
+                "lora_alpha": unilora_args.lora_alpha,
+                "learning_rate": training_args.learning_rate,
+                "batch_size": training_args.per_device_train_batch_size,
+                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                "bits": unilora_args.bits,
+            },
+        )
+        from swanlab.integration.huggingface import SwanLabCallback
+
+        trainer.add_callback(SwanLabCallback(project="Uni-LoRA-Qwen-MoE"))
+        logger.info("SwanLab integration enabled")
+
     if training_args.do_train:
         logger.info("*** Train ***")
         train_result = trainer.train(resume_from_checkpoint=checkpoint_dir)
@@ -861,20 +1011,17 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate(metric_key_prefix="eval")
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    # Save final model
     if training_args.do_train:
         logger.info("Saving final model...")
         trainer.save_model()
         tokenizer.save_pretrained(training_args.output_dir)
 
-        # Save Uni-LoRA specific parameters
         if hasattr(model, "unilora_shared_vector"):
             unilora_params = {"unilora_shared_vector": model.unilora_shared_vector.data}
             for name, param in model.named_parameters():

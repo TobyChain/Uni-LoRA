@@ -1,162 +1,164 @@
+#!/usr/bin/env python
 """
 使用 FastChat 测试训练前后的模型效果
-对比原始模型和训练后的 Uni-LoRA 模型
+支持原始模型和训练后的 Uni-LoRA 模型对比
 """
 
 import argparse
 import json
 import os
-from typing import List
+import sys
+import time
+from pathlib import Path
+import logging
+from typing import List, Dict, Any, Optional, Tuple
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+logging.basicConfig(level=logging.INFO)
+
+# FastChat imports (optional)
 try:
-    import torch
     from fastchat.model.model_adapter import (
-        get_conversation_template,
-        load_model,
+        get_conversation_template,  # noqa: F401
+        load_model as fastchat_load_model,  # noqa: F401
     )
+
+    FASTCHAT_AVAILABLE = True
 except ImportError:
-    print("FastChat 未安装，请先安装: pip install fschat")
-    print("或者使用 CLI 模式进行手动测试")
-    torch = None
+    FASTCHAT_AVAILABLE = False
+    print("FastChat 未安装，将使用内置加载方法")
+
+# Add modeling path for Uni-LoRA
+sys.path.insert(0, str(Path(__file__).parent.parent / "modeling"))
+try:
+    from modeling_unilora_moe import load_unilora_checkpoint
+
+    UNILORA_AVAILABLE = True
+except ImportError:
+    UNILORA_AVAILABLE = False
+    print("Uni-LoRA 模块未找到")
 
 
-def load_model_for_testing(model_path: str, device: str = "cuda"):
-    """加载模型用于测试"""
-    try:
-        model, tokenizer = load_model(
-            model_path,
-            device=device,
-            num_gpus=1,
-            max_gpu_memory=None,
-            load_8bit=False,
-            cpu_offloading=False,
-            debug=False,
-        )
-        return model, tokenizer
-    except Exception as e:
-        print(f"加载模型失败: {e}")
-        return None, None
+def load_base_model(
+    model_path: str,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tuple[Any, Any]:
+    """加载基础模型"""
+    print(f"加载基础模型: {model_path}")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        padding_side="left",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=dtype,
+        device_map="cuda",
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    return model, tokenizer
+
+
+# load_unilora_model replaced by shared implementation
 
 
 def generate_response(
-    model, tokenizer, prompt: str, max_new_tokens: int = 512, temperature: float = 0.7
-) -> str:
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+) -> Tuple[str, float]:
     """生成模型响应"""
+    messages = [{"role": "user", "content": prompt}]
+
     try:
-        # 获取对话模板
-        conv = get_conversation_template("qwen")
-        if conv is None:
-            conv = get_conversation_template("vicuna")
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        # Fallback for models without chat template
+        text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-        conv.append_message(conv.roles[0], prompt)
-        conv.append_message(conv.roles[1], None)
-        prompt_text = conv.get_prompt()
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-        # Tokenize
-        inputs = tokenizer([prompt_text], return_tensors="pt").to(model.device)
-
-        # Generate
-        output_ids = model.generate(
+    start_time = time.time()
+    with torch.no_grad():
+        outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
+            temperature=temperature if temperature > 0 else 1.0,
+            top_p=top_p,
             do_sample=temperature > 0,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
+    elapsed = time.time() - start_time
 
-        # Decode
-        output_ids = output_ids[0][len(inputs["input_ids"][0]) :]
-        response = tokenizer.decode(output_ids, skip_special_tokens=True)
+    response = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    )
 
-        # 清理停止词
-        stop_str = conv.sep2 if hasattr(conv, "sep2") else conv.sep
-        if stop_str:
-            response = response.split(stop_str)[0]
-
-        return response.strip()
-    except Exception as e:
-        print(f"生成响应失败: {e}")
-        return ""
+    return response.strip(), elapsed
 
 
-def test_with_fastchat_api(
-    model_path: str, test_prompts: List[str], output_file: str = None
-):
-    """使用 FastChat API 测试模型"""
+def test_model(
+    model,
+    tokenizer,
+    test_prompts: List[Dict[str, Any]],
+    model_name: str,
+    output_file: Optional[str] = None,
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+) -> List[Dict[str, Any]]:
+    """测试单个模型"""
     print(f"\n{'=' * 60}")
-    print(f"使用 FastChat API 测试模型: {model_path}")
+    print(f"测试模型: {model_name}")
     print(f"{'=' * 60}\n")
 
-    if torch is None:
-        print("PyTorch 未安装，尝试使用 CLI 方式...")
-        return test_with_cli_simple(model_path, test_prompts, output_file)
-
     results = []
+    total_time = 0
 
-    # 加载模型
-    print("正在加载模型...")
-    try:
-        model, tokenizer = load_model(
-            model_path,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            num_gpus=1,
-            max_gpu_memory=None,
-            load_8bit=False,
-            cpu_offloading=False,
-            debug=False,
-        )
-        print("模型加载成功！\n")
-    except Exception as e:
-        print(f"模型加载失败: {e}")
-        return []
+    for i, item in enumerate(test_prompts, 1):
+        prompt = item.get("prompt", item.get("question", str(item)))
+        category = item.get("category", "general")
 
-    # 获取对话模板
-    conv_template = get_conversation_template("qwen")
-    if conv_template is None:
-        conv_template = get_conversation_template("vicuna")
-
-    for i, prompt in enumerate(test_prompts, 1):
-        print(f"\n[测试 {i}/{len(test_prompts)}]")
+        print(f"\n[测试 {i}/{len(test_prompts)}] ({category})")
         print(f"提示: {prompt}")
         print("-" * 60)
 
         try:
-            # 构建对话
-            conv = conv_template.copy()
-            conv.append_message(conv.roles[0], prompt)
-            conv.append_message(conv.roles[1], None)
-            prompt_text = conv.get_prompt()
-
-            # Tokenize
-            inputs = tokenizer([prompt_text], return_tensors="pt").to(model.device)
-
-            # Generate
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.7,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
+            response, elapsed = generate_response(
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
             )
-
-            # Decode
-            output_ids = output_ids[0][len(inputs["input_ids"][0]) :]
-            response = tokenizer.decode(output_ids, skip_special_tokens=True)
-
-            # 清理停止词
-            if hasattr(conv, "sep2") and conv.sep2:
-                response = response.split(conv.sep2)[0]
-            elif hasattr(conv, "sep") and conv.sep:
-                response = response.split(conv.sep)[0]
-
-            response = response.strip()
-            print(f"响应: {response}")
+            total_time += elapsed
+            print(
+                f"响应 ({elapsed:.2f}s): {response[:200]}{'...' if len(response) > 200 else ''}"
+            )
 
             results.append(
                 {
                     "prompt": prompt,
+                    "category": category,
                     "response": response,
-                    "model_path": model_path,
+                    "generation_time": round(elapsed, 2),
+                    "model": model_name,
                 }
             )
         except Exception as e:
@@ -164,49 +166,22 @@ def test_with_fastchat_api(
             results.append(
                 {
                     "prompt": prompt,
+                    "category": category,
                     "response": f"ERROR: {str(e)}",
-                    "model_path": model_path,
+                    "generation_time": 0,
+                    "model": model_name,
                 }
             )
 
-    # 保存结果
-    if output_file:
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"\n结果已保存到: {output_file}")
-
-    return results
-
-
-def test_with_cli_simple(
-    model_path: str, test_prompts: List[str], output_file: str = None
-):
-    """使用简单的 CLI 方式测试（备用方法）"""
+    # 统计信息
     print(f"\n{'=' * 60}")
-    print(f"使用 CLI 测试模型: {model_path}")
-    print(f"{'=' * 60}\n")
-
-    results = []
-
-    for i, prompt in enumerate(test_prompts, 1):
-        print(f"\n[测试 {i}/{len(test_prompts)}]")
-        print(f"提示: {prompt}")
-        print("-" * 60)
-        print("提示: 请手动运行以下命令进行测试:")
-        print(f"  python -m fastchat.serve.cli --model-path {model_path}")
-        print("然后在交互界面中输入上述提示。")
-
-        results.append(
-            {
-                "prompt": prompt,
-                "response": "MANUAL_TEST_REQUIRED",
-                "model_path": model_path,
-            }
-        )
+    print(f"测试完成: {len(results)} 个样本, 总耗时 {total_time:.2f}s")
+    print(f"平均每样本耗时: {total_time / len(results):.2f}s")
 
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
+        print(f"结果已保存到: {output_file}")
 
     return results
 
@@ -214,9 +189,11 @@ def test_with_cli_simple(
 def compare_models(
     base_model_path: str,
     trained_model_path: str,
-    test_prompts: List[str],
+    test_prompts: List[Dict[str, Any]],
     output_dir: str = "./test_results",
-):
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+) -> List[Dict[str, Any]]:
     """对比两个模型的效果"""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -228,18 +205,60 @@ def compare_models(
     print(f"测试提示数量: {len(test_prompts)}")
     print("=" * 80)
 
+    # 检查训练后模型路径
+    trained_path = Path(trained_model_path)
+    unilora_params_path = trained_path / "unilora_params.pt"
+
+    if not unilora_params_path.exists():
+        # Check for adapter_model subdirectory
+        adapter_params_path = trained_path / "adapter_model" / "unilora_params.pt"
+        if adapter_params_path.exists():
+            unilora_params_path = adapter_params_path
+            use_unilora = True
+        else:
+            print("警告: 未找到 unilora_params.pt，将使用 FastChat 加载方式")
+            use_unilora = False
+    else:
+        use_unilora = True
+
     # 测试原始模型
-    base_results = test_with_fastchat_api(
-        base_model_path,
+    print("\n" + "=" * 40)
+    print("加载原始模型...")
+    base_model, base_tokenizer = load_base_model(base_model_path)
+    base_results = test_model(
+        base_model,
+        base_tokenizer,
         test_prompts,
+        "base_model",
         os.path.join(output_dir, "base_model_results.json"),
+        max_new_tokens,
+        temperature,
     )
 
+    # 释放原始模型内存
+    del base_model, base_tokenizer
+    torch.cuda.empty_cache()
+
     # 测试训练后模型
-    trained_results = test_with_fastchat_api(
-        trained_model_path,
+    print("\n" + "=" * 40)
+    print("加载训练后模型...")
+    if use_unilora:
+        trained_model, trained_tokenizer = load_unilora_checkpoint(
+            base_model_path,
+            str(unilora_params_path),
+        )
+
+    else:
+        trained_model, trained_tokenizer = load_base_model(trained_model_path)
+
+    trained_results = test_model(
+        trained_model,
+        trained_tokenizer,
         test_prompts,
+        "trained_model",
         os.path.join(output_dir, "trained_model_results.json"),
+        max_new_tokens,
+        temperature,
     )
 
     # 生成对比报告
@@ -248,8 +267,11 @@ def compare_models(
         comparison.append(
             {
                 "prompt": base["prompt"],
+                "category": base["category"],
                 "base_model_response": base["response"],
+                "base_model_time": base["generation_time"],
                 "trained_model_response": trained["response"],
+                "trained_model_time": trained["generation_time"],
             }
         )
 
@@ -257,17 +279,19 @@ def compare_models(
     with open(comparison_file, "w", encoding="utf-8") as f:
         json.dump(comparison, f, ensure_ascii=False, indent=2)
 
-    # 打印对比结果
+    # 打印对比结果摘要
     print("\n" + "=" * 80)
-    print("对比结果")
+    print("对比结果摘要")
     print("=" * 80)
     for i, comp in enumerate(comparison, 1):
-        print(f"\n[测试 {i}]")
+        print(f"\n[测试 {i}] {comp['category']}")
         print(f"提示: {comp['prompt']}")
-        print("\n原始模型响应:")
-        print(f"  {comp['base_model_response']}")
-        print("\n训练后模型响应:")
-        print(f"  {comp['trained_model_response']}")
+        print(f"\n原始模型 ({comp['base_model_time']:.2f}s):")
+        base_resp = comp["base_model_response"]
+        print(f"  {base_resp[:150]}{'...' if len(base_resp) > 150 else ''}")
+        print(f"\n训练后模型 ({comp['trained_model_time']:.2f}s):")
+        trained_resp = comp["trained_model_response"]
+        print(f"  {trained_resp[:150]}{'...' if len(trained_resp) > 150 else ''}")
         print("-" * 80)
 
     print(f"\n详细对比结果已保存到: {comparison_file}")
@@ -275,32 +299,35 @@ def compare_models(
     return comparison
 
 
+def load_test_prompts(file_path: str) -> List[Dict[str, Any]]:
+    """加载测试提示"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        return data
+    return [data]
+
+
 def main():
     parser = argparse.ArgumentParser(description="使用 FastChat 测试模型效果")
     parser.add_argument(
         "--base-model",
         type=str,
-        default="Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        default="/root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat",
         help="原始模型路径",
     )
     parser.add_argument(
         "--trained-model",
         type=str,
-        required=True,
-        help="训练后的模型路径（包含 Uni-LoRA 适配器）",
+        default="../training/output/qwen_moe_unilora_pipeline_0107/stage2",
+        help="训练后的模型路径（包含 unilora_params.pt）",
     )
     parser.add_argument(
         "--test-prompts-file",
         type=str,
-        default=None,
-        help="测试提示文件（JSON 格式，每行一个提示）",
-    )
-    parser.add_argument(
-        "--test-prompts",
-        type=str,
-        nargs="+",
-        default=None,
-        help="测试提示列表",
+        default="test_prompts.json",
+        help="测试提示文件（JSON 格式）",
     )
     parser.add_argument(
         "--output-dir",
@@ -311,39 +338,42 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["compare", "single"],
+        choices=["compare", "single", "base_only"],
         default="compare",
-        help="测试模式: compare (对比) 或 single (仅测试训练后模型)",
+        help="测试模式: compare (对比), single (仅训练后模型), base_only (仅原始模型)",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=512,
+        help="最大生成 token 数",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="采样温度",
     )
 
     args = parser.parse_args()
 
-    # 准备测试提示
-    test_prompts = []
-
-    if args.test_prompts_file:
-        with open(args.test_prompts_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                test_prompts = [
-                    item.get("prompt", item) if isinstance(item, dict) else item
-                    for item in data
-                ]
-            else:
-                test_prompts = [data.get("prompt", str(data))]
-    elif args.test_prompts:
-        test_prompts = args.test_prompts
+    # 加载测试提示
+    if os.path.exists(args.test_prompts_file):
+        test_prompts = load_test_prompts(args.test_prompts_file)
     else:
-        # 默认测试提示
+        print(f"警告: 测试提示文件不存在: {args.test_prompts_file}")
         test_prompts = [
-            "解释一下什么是机器学习。",
-            "写一个 Python 函数来计算斐波那契数列。",
-            "如何提高工作效率？",
-            "介绍一下量子计算的基本原理。",
-            "用中文解释一下相对论。",
+            {"prompt": "解释一下什么是机器学习。", "category": "知识问答"},
+            {
+                "prompt": "写一个 Python 函数来计算斐波那契数列。",
+                "category": "代码生成",
+            },
+            {"prompt": "如何提高工作效率？", "category": "建议咨询"},
         ]
 
     print(f"使用 {len(test_prompts)} 个测试提示")
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # 执行测试
     if args.mode == "compare":
@@ -352,12 +382,47 @@ def main():
             args.trained_model,
             test_prompts,
             args.output_dir,
+            args.max_new_tokens,
+            args.temperature,
         )
-    else:
-        test_with_fastchat_api(
-            args.trained_model,
+    elif args.mode == "single":
+        # 仅测试训练后模型
+        trained_path = Path(args.trained_model)
+        unilora_params_path = trained_path / "unilora_params.pt"
+
+        if not unilora_params_path.exists():
+            # Check for adapter_model subdirectory
+            adapter_params_path = trained_path / "adapter_model" / "unilora_params.pt"
+            if adapter_params_path.exists():
+                unilora_params_path = adapter_params_path
+
+        if unilora_params_path.exists():
+            model, tokenizer = load_unilora_checkpoint(
+                args.base_model, str(unilora_params_path)
+            )
+
+        else:
+            model, tokenizer = load_base_model(args.trained_model)
+
+        test_model(
+            model,
+            tokenizer,
             test_prompts,
+            "trained_model",
             os.path.join(args.output_dir, "trained_model_results.json"),
+            args.max_new_tokens,
+            args.temperature,
+        )
+    else:  # base_only
+        model, tokenizer = load_base_model(args.base_model)
+        test_model(
+            model,
+            tokenizer,
+            test_prompts,
+            "base_model",
+            os.path.join(args.output_dir, "base_model_results.json"),
+            args.max_new_tokens,
+            args.temperature,
         )
 
 
