@@ -1,0 +1,56 @@
+nohup: ignoring input
+=== Testing Standard LoRA Model (FAST MODE - 4bit BS8) ===
+Base Model: /root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat
+Adapter: ../training/output/standard_lora/checkpoint-2000
+Test Prompts: ./test_prompts_tcmqa.json
+Output: ./test_results_tcmqa_fast
+Batch Size: 8
+Precision: 4-bit (bits=4)
+
+2026-01-22 21:56:24,691 - INFO - __main__ - Loading base model from /root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat
+`torch_dtype` is deprecated! Use `dtype` instead!
+2026-01-22 21:56:30,867 - INFO - accelerate.utils.modeling - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+Loading checkpoint shards:   0%|          | 0/8 [00:00<?, ?it/s]Loading checkpoint shards:  12%|█▎        | 1/8 [00:06<00:46,  6.66s/it]Loading checkpoint shards:  25%|██▌       | 2/8 [00:13<00:40,  6.67s/it]Loading checkpoint shards:  38%|███▊      | 3/8 [00:20<00:34,  6.86s/it]Loading checkpoint shards:  50%|█████     | 4/8 [00:29<00:30,  7.60s/it]Loading checkpoint shards:  62%|██████▎   | 5/8 [00:36<00:22,  7.54s/it]Loading checkpoint shards:  75%|███████▌  | 6/8 [00:47<00:17,  8.65s/it]Loading checkpoint shards:  88%|████████▊ | 7/8 [00:56<00:08,  8.82s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:56<00:00,  6.12s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:56<00:00,  7.11s/it]
+2026-01-22 21:57:30,118 - INFO - __main__ - Loading PEFT adapter from ../training/output/standard_lora/checkpoint-2000
+2026-01-22 21:58:15,777 - INFO - __main__ - PEFT adapter loaded successfully
+2026-01-22 21:58:15,948 - INFO - __main__ - Loading test prompts from ./test_prompts_tcmqa.json
+2026-01-22 21:58:15,950 - INFO - __main__ - Loaded 50 test prompts
+2026-01-22 21:58:15,950 - INFO - __main__ - Processing batch 1/7 (Prompts 1-8)
+2026-01-22 22:08:46,786 - INFO - __main__ - Processing batch 2/7 (Prompts 9-16)
+2026-01-22 22:19:06,186 - INFO - __main__ - Processing batch 3/7 (Prompts 17-24)
+2026-01-22 22:27:02,974 - INFO - __main__ - Processing batch 4/7 (Prompts 25-32)
+2026-01-22 22:37:56,078 - INFO - __main__ - Processing batch 5/7 (Prompts 33-40)
+2026-01-22 22:48:39,879 - INFO - __main__ - Processing batch 6/7 (Prompts 41-48)
+2026-01-22 22:59:04,488 - INFO - __main__ - Processing batch 7/7 (Prompts 49-50)
+2026-01-22 23:01:38,930 - INFO - __main__ - Results saved to ./test_results_tcmqa_fast/test_results.json
+
+=== Test Results Summary ===
+
+--- Prompt 1 ---
+Input: 女人月经不来吃什么药？...
+Output: 无
+
+你好，一般情况下，月经推迟一周内属于正常现象。如果超过7天还没有来月经，应首先排除怀孕的可能，如怀疑怀孕，可先用早孕试纸进行检测或到医院检查确诊，如果没有怀孕，且经检查确定为有排卵，则可在月经周期第5天开始口服短效避孕药，以促进卵巢排卵。对于月经迟迟未来者，应尽早去正规医院进行相关检查，明确病因后再针对性用药治疗。不可擅自盲目用药，以免耽误病情。...
+
+--- Prompt 2 ---
+Input: 尿道炎的症状表现...
+Output: 有哪些
+我刚得了尿道炎，症状表现有哪些？1、泌尿系感染的患者会出现尿痛、尿频、尿急等症状。2、部分患者会有尿道分泌物，呈黄色或者脓性。3、如果合并有前列腺炎，患者会出现会阴部坠胀不适、睾丸疼痛等不适。4、部分患者会出现发热。5、合并有膀胱结石或肾结石时，患者会出现血尿。6、合并有前列腺炎时，患者会出现阴囊坠胀不适。7、部分患者会出现腰痛。8、部分患者会出现乏力、头晕、精神不振等全身症状。9、部分患...
+
+--- Prompt 3 ---
+Input: 虫咬皮炎会传染吗...
+Output: ，虫咬皮炎会传染吗
+你好，虫咬皮炎是不会传染的。虫咬皮炎是由昆虫叮咬或接触毒液、皮屑等引起的皮肤急性炎症反应，主要是由于蚊虫叮咬引起的过敏反应。虫咬皮炎不是传染病，不会传染。虫咬皮炎患者在日常生活中要注意个人卫生，勤洗澡，勤换衣物，注意隔离，不要和他人共用生活用品。对于虫咬皮炎的治疗，建议患者去正规医院就诊，在专业医生指导下进行治疗。...
+
+--- Prompt 4 ---
+Input: 新生儿常见的疾病有哪些...
+Output: ？要怎么预防？，无
+
+你好，新生儿常见的疾病有新生儿黄疸、新生儿肺炎、新生儿脐炎、新生儿败血症等。新生儿黄疸是新生儿期常见症状，主要表现为皮肤、黏膜、巩膜等黄染，严重时可影响呼吸和进食。新生儿肺炎是指发生在新生儿期的肺实质炎症，主要由感染引起，临床表现有发热、咳嗽、气促、呼吸困难等。新生儿脐炎是指脐部发生的急性化脓性感染，多因细菌经产道、伤口或皮肤侵入所致，病原菌以金黄色葡萄球菌多见。新生儿败血症...
+
+--- Prompt 5 ---
+Input: 睾丸囊肿怎么治疗...
+Output: 好，医生我今年38岁了，最近睾丸总是不舒服，去医院仔细检查说是睾丸囊肿，请问睾丸囊肿怎么治疗好
+你好，睾丸囊肿的治疗方法包括手术治疗和非手术治疗。非手术治疗主要是药物治疗，可以缓解症状，但是不能彻底治愈，而且容易病发。手术治疗是根治性的治疗方法，可以完全摘除囊肿，防止其病发。建议患者根据自身情况选择合适的治疗方法。对于男性来说，睾丸是最重要的性器官，对男性的生育能力、第二性征的保持，以及性功能起着...
+
+✅ Fast Testing Completed! Check results in: ./test_results_tcmqa_fast/test_results.json

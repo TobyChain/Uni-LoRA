@@ -1,0 +1,57 @@
+2026-01-23 13:35:51,838 - INFO - __main__ - Loading base model from /root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat
+`torch_dtype` is deprecated! Use `dtype` instead!
+2026-01-23 13:35:53,300 - INFO - accelerate.utils.modeling - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+Loading checkpoint shards:   0%|          | 0/8 [00:00<?, ?it/s]Loading checkpoint shards:  12%|█▎        | 1/8 [00:04<00:28,  4.07s/it]Loading checkpoint shards:  25%|██▌       | 2/8 [00:06<00:19,  3.23s/it]Loading checkpoint shards:  38%|███▊      | 3/8 [00:08<00:13,  2.77s/it]Loading checkpoint shards:  50%|█████     | 4/8 [00:10<00:09,  2.49s/it]Loading checkpoint shards:  62%|██████▎   | 5/8 [00:13<00:07,  2.51s/it]Loading checkpoint shards:  75%|███████▌  | 6/8 [00:16<00:04,  2.50s/it]Loading checkpoint shards:  88%|████████▊ | 7/8 [00:19<00:02,  2.87s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:20<00:00,  2.10s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:20<00:00,  2.51s/it]
+2026-01-23 13:36:14,280 - INFO - __main__ - Loading PEFT adapter from ../training/output/standard_lora
+2026-01-23 13:36:41,228 - INFO - __main__ - PEFT adapter loaded successfully
+2026-01-23 13:36:41,396 - INFO - __main__ - Loading test prompts from ./test_prompts_tcmqa.json
+2026-01-23 13:36:41,396 - INFO - __main__ - Loaded 50 test prompts
+2026-01-23 13:36:41,396 - INFO - __main__ - Processing batch 1/13 (Prompts 1-4)
+2026-01-23 13:40:00,091 - INFO - __main__ - Processing batch 2/13 (Prompts 5-8)
+2026-01-23 13:43:29,773 - INFO - __main__ - Processing batch 3/13 (Prompts 9-12)
+2026-01-23 13:46:13,756 - INFO - __main__ - Processing batch 4/13 (Prompts 13-16)
+2026-01-23 13:47:56,979 - INFO - __main__ - Processing batch 5/13 (Prompts 17-20)
+2026-01-23 13:49:28,825 - INFO - __main__ - Processing batch 6/13 (Prompts 21-24)
+2026-01-23 13:51:01,046 - INFO - __main__ - Processing batch 7/13 (Prompts 25-28)
+2026-01-23 13:52:54,161 - INFO - __main__ - Processing batch 8/13 (Prompts 29-32)
+2026-01-23 13:54:32,168 - INFO - __main__ - Processing batch 9/13 (Prompts 33-36)
+2026-01-23 13:56:09,285 - INFO - __main__ - Processing batch 10/13 (Prompts 37-40)
+2026-01-23 13:59:16,141 - INFO - __main__ - Processing batch 11/13 (Prompts 41-44)
+2026-01-23 14:01:13,848 - INFO - __main__ - Processing batch 12/13 (Prompts 45-48)
+2026-01-23 14:03:02,765 - INFO - __main__ - Processing batch 13/13 (Prompts 49-50)
+2026-01-23 14:05:22,645 - INFO - __main__ - Results saved to ./test_results_tcmqa/test_results.json
+
+=== Test Results Summary ===
+
+--- Prompt 1 ---
+Input: Below is an instruction that describes a task. Write a response that appropriately completes the req...
+Output: 月经不来的病因复杂多样，通常需要在明确诊断下才能用药，建议患者到专业的医院检查治疗。
+治疗月经不来常用的药物包括：
+1，性激素类药物：主要采用雌激素及孕激素治疗，治疗的目的在于促进和维持患者的第二性征及月经，以及恢复排卵和生育功能。常用的雌激素包括戊酸雌二醇、妊马雌酮等；孕激素则主要应用黄体酮、醋酸甲羟孕酮等。治疗时可以单一应用雌激素或孕激素，也可以选择雌、孕激素人工周期疗法。区别在于单用雌激素治...
+
+--- Prompt 2 ---
+Input: Below is an instruction that describes a task. Write a response that appropriately completes the req...
+Output: 尿道炎是指尿道黏膜炎症性疾病，主要表现为尿频、尿急、尿痛、尿道不适等排尿异常症状，部分患者还可有血尿表现。
+1、尿道刺激症状：是最常见的症状，主要表现为尿道口发红、刺痒、灼热、疼痛，甚至出现尿道分泌物，多为浆液性或脓性，少数也可为稀薄状。严重者可有血尿表现。
+2、全身症状：部分患者还可有发热、寒战、头痛等全身感染症状。
+3、其他：部分患者可能合并有泌尿系结石，出现尿痛、排尿困难等症状。
+尿道炎是一...
+
+--- Prompt 3 ---
+Input: Below is an instruction that describes a task. Write a response that appropriately completes the req...
+Output: 虫咬皮炎不会传染。
+虫咬皮炎是由于昆虫叮咬或接触外来的物质后，所引起的皮肤炎症反应，主要表现为风团、红斑等。它是一种过敏性皮肤病，和传染病不同，是不会传染的。
+虫咬皮炎的患者要及时去医院就诊，由医生进行治疗。对于症状比较轻的患者，可以局部涂抹炉甘石洗剂或者糖皮质激素制剂。如果瘙痒剧烈，可以用抗组胺药物进行治疗，比如西替利嗪、氯雷他定等。...
+
+--- Prompt 4 ---
+Input: Below is an instruction that describes a task. Write a response that appropriately completes the req...
+Output: 新生儿常见的疾病包括：
+1、呼吸系统疾病：如新生儿窒息、新生儿肺炎等，可能由早产、羊水栓塞等引起。若出现呼吸暂停、青紫等表现，应警惕。
+2、消化系统疾病：如新生儿坏死性小肠结肠炎、新生儿败血症等，可能由早产、感染等引起。若出现腹胀、发热、腹泻等表现，应警惕。
+3、神经系统疾病：如新生儿缺氧缺血性脑病、新生儿颅内出血、新生儿低血糖等，可能由宫内窘迫、窒息、低血糖等引起。若出现嗜睡、惊厥、呕吐等表现，...
+
+--- Prompt 5 ---
+Input: Below is an instruction that describes a task. Write a response that appropriately completes the req...
+Output: 睾丸囊肿的治疗，主要与其病因有关。
+1、如果是附睾囊肿，一般不需要进行特殊治疗。如果患者的症状比较严重，比如出现疼痛等症状，则可以在医生的指导下，使用非甾体类抗炎药等进行治疗。
+2、如果是生理性囊肿，患者通常不需要进行治疗，可以定期观察。需要注意的是，如果囊肿比较大，患者可能会出现不适，此时可以通过穿刺抽液的方式，将囊肿内的液体抽出。此外，还可以在局部注射硬化剂，使囊壁产生无菌性炎症反应，从而达到...

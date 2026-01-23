@@ -1,0 +1,59 @@
+=== Testing Standard LoRA Model ===
+Base Model: /root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat
+Adapter Path: ../training/output/standard_lora
+Output Directory: ./test_results
+Log File: ./test_results/test.log
+
+2026-01-23 13:30:13,754 - INFO - __main__ - Loading base model from /root/autodl-tmp/model/Qwen/Qwen1.5-MoE-A2.7B-Chat
+`torch_dtype` is deprecated! Use `dtype` instead!
+2026-01-23 13:30:17,985 - INFO - accelerate.utils.modeling - We will use 90% of the memory on device 0 for storing the model, and 10% for the buffer to avoid OOM. You can set `max_memory` in to a higher value to use more memory (at your own risk).
+Loading checkpoint shards:   0%|          | 0/8 [00:00<?, ?it/s]Loading checkpoint shards:  12%|█▎        | 1/8 [00:05<00:41,  5.88s/it]Loading checkpoint shards:  25%|██▌       | 2/8 [00:09<00:26,  4.44s/it]Loading checkpoint shards:  38%|███▊      | 3/8 [00:12<00:18,  3.76s/it]Loading checkpoint shards:  50%|█████     | 4/8 [00:14<00:13,  3.33s/it]Loading checkpoint shards:  62%|██████▎   | 5/8 [00:18<00:10,  3.38s/it]Loading checkpoint shards:  75%|███████▌  | 6/8 [00:21<00:06,  3.30s/it]Loading checkpoint shards:  88%|████████▊ | 7/8 [00:27<00:04,  4.22s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:28<00:00,  3.03s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:28<00:00,  3.52s/it]
+2026-01-23 13:30:47,008 - INFO - __main__ - Loading PEFT adapter from ../training/output/standard_lora
+2026-01-23 13:31:14,909 - INFO - __main__ - PEFT adapter loaded successfully
+2026-01-23 13:31:15,138 - INFO - __main__ - Processing batch 1/1 (Prompts 1-3)
+
+=== Demo Mode ===
+
+Prompt: Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+请解释什么是中医的阴阳理论？
+
+### Response: 
+Response: 阴阳是中国古代朴素的哲学范畴。最早出自《易传·系辞》，后来在战国晚期的《黄帝内经》一书中有了系统的阐述，认为阴阳是相互对立又相互统一的两个方面，是构成宇宙万物及各种自然现象变化的基础。
+1、阴阳属性
+（1）阴阳属性是自然界普遍存在的两种属性，如冷与热、动与静、上与下等，它们之间可以相互转化。
+（2）阴阳属性还体现在人体上，如寒热、虚实、气血等。
+2、阴阳概念
+阴阳代表了事物的相对性，比如“寒极生热，热极生寒”，“物极必反”。所以，阴阳理论具有一定的包容性，不是孤立存在的，而是相互联系、相互制约、相互转化的。
+
+Prompt: Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+What is the capital of France?
+
+### Response: 
+Response: Paris
+The capital of France is Paris, which is located in the northern part of the country on the Seine River. The city is known for its iconic landmarks such as the Eiffel Tower, Notre-Dame Cathedral, and the Louvre Museum, and it is also famous for its fashion, cuisine, art, and culture. With a population of over 2 million people, Paris is one of the most populous cities in Europe and is considered to be one of the most visited cities in the world.
+
+Prompt: Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+Write a short poem about spring.
+
+### Response: 
+Response: 春天，是大地的重生，
+万物苏醒，生机盎然。
+冰雪消融，溪流潺潺，
+花儿开放，鸟儿欢唱。
+
+春天，是希望的象征，
+温暖阳光，照耀人间。
+农民播种，希望丰收，
+孩子们嬉戏，心情舒畅。
+
+春天，是生命的奇迹，
+小草破土，柳树发芽，
+万物复苏，色彩斑斓，
+一切都充满了新的希望。
+✅ Testing Completed! Results saved to ./test_results
